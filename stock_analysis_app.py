@@ -93,6 +93,22 @@ STAGE1_TAKE_PROFIT_SELL_PCT = 0.20     # 第一階段（鎖定獲利）：達目
 TRAILING_STOP_MA_WINDOW = 20           # 第二階段（追蹤停利）：只要收盤守住這條均線之上就全程持有
 TRAILING_STOP_SELL_PCT = 0.30          # 第二階段：收盤實體跌破上述均線時，調節的持股比例
 
+# --- 使用者「持倉風控與紀律」機制（範本第一、二、四節）---
+# 這幾項規則需要知道使用者的「實際持倉狀態」（成本、股數、帳戶總資產、目標倉位），
+# 單靠這支工具原本抓的股價資料無法算出來，所以額外設計成「選填」區塊：使用者上傳
+# 自己的交易紀錄 CSV，並手動輸入帳戶總資產／現金水位／目標總倉位這幾個工具無法
+# 自動得知的數字，才會顯示這個區塊的檢核結果；不提供的話，完全不影響上方原本的
+# 個股技術面分析。
+SINGLE_STOCK_MAX_EXPOSURE_PCT = 0.35      # 單一股票最大曝險：帳戶總資產上限 35%
+SINGLE_ADDON_MAX_PCT_OF_TARGET = 0.25     # 單次加碼上限：不得超過目標總倉位 25%
+CASH_RESERVE_MIN_PCT = 0.15               # 預留現金防禦率：常態維持 15%~20%
+CASH_RESERVE_MAX_PCT = 0.20
+PYRAMID_A_RSI_MAX = 45                    # A. 逢低回測買點：日線 RSI <= 45
+PYRAMID_A_MA_TOLERANCE_PCT = 0.03         # A. 「回測20MA或50MA止穩」的貼近容忍度（正負3%）
+PYRAMID_B_VOLUME_MULTIPLE = 1.5           # B. 突破確認買點：成交量須高於20日均量的1.5倍
+PYRAMID_B_LOOKBACK_WIN = 20               # B. 「前高壓力帶」用近幾日高點判斷
+ANTI_FOMO_WINDOW_DAYS = 3                 # 反FOMO回補檢查：賣出後幾個自然日內的買回都列入檢查
+
 # 新聞情緒五級分類配色（Bearish=深紅 ～ Bullish=深綠，符合金融情緒分析慣例配色）
 SENTIMENT_LABELS_ORDER = ["Bearish", "Somewhat-Bearish", "Neutral", "Somewhat-Bullish", "Bullish"]
 SENTIMENT_COLORS = {
@@ -460,6 +476,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["volume_ma20"] = df["volume"].rolling(20, min_periods=1).mean()
     df["ma5"] = df["close"].rolling(5, min_periods=1).mean()
     df["ma20"] = df["close"].rolling(20, min_periods=1).mean()
+    df["ma50"] = df["close"].rolling(50, min_periods=1).mean()
     df["ma60"] = df["close"].rolling(60, min_periods=1).mean()
     df["bb_upper"], df["bb_mid"], df["bb_lower"] = compute_bollinger_bands(df["close"], 20, 2.0)
     df["kd_k"], df["kd_d"] = compute_kd(df, 9)
@@ -774,6 +791,258 @@ def _fmt_stop_plan_lines(stop_plan: dict) -> str:
         f"- 停利①第一階段目標價：{stage1_line}\n"
         f"- 停利②第二階段追蹤停利：{trailing_line}"
     )
+
+
+# ----------------------------------------------------------------------------
+# 2.5 持倉風控與紀律檢核（範本第一、二、四節：曝險/現金上限、分批建倉型態、反FOMO回補）
+# ----------------------------------------------------------------------------
+
+def parse_trade_log(raw_df: pd.DataFrame):
+    """把使用者上傳的交易紀錄 CSV（欄位：Date,Type,Symbol,Name,Price,Quantity,Reason）
+    整理成標準化格式。看不懂的列（日期/價格/股數/買賣別格式錯誤）會被跳過並回傳警告文字，
+    而不是讓整支工具直接報錯中斷。回傳 (整理後的DataFrame, 警告文字list)。
+    """
+    df = raw_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    col_map = {}
+    for c in df.columns:
+        lc = c.lower()
+        if lc == "date":
+            col_map[c] = "date"
+        elif lc == "type":
+            col_map[c] = "type"
+        elif lc == "symbol":
+            col_map[c] = "symbol"
+        elif lc == "price":
+            col_map[c] = "price"
+        elif lc in ("quantity", "qty", "shares"):
+            col_map[c] = "quantity"
+        elif lc == "reason":
+            col_map[c] = "reason"
+    df = df.rename(columns=col_map)
+
+    required = {"date", "type", "price", "quantity"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"交易紀錄缺少必要欄位：{'、'.join(sorted(missing))}（需要 Date, Type, Price, Quantity）")
+
+    warnings = []
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["type_norm"] = df["type"].astype(str).str.strip().str.lower()
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
+    if "reason" not in df.columns:
+        df["reason"] = ""
+    df["reason"] = df["reason"].fillna("")
+    if "symbol" not in df.columns:
+        df["symbol"] = ""
+
+    valid_mask = (
+        df["date"].notna() & df["price"].notna() & df["quantity"].notna()
+        & df["type_norm"].isin(["buy", "sell"])
+    )
+    n_bad = int((~valid_mask).sum())
+    if n_bad > 0:
+        warnings.append(f"有 {n_bad} 筆資料格式看不懂（日期／價格／股數／買賣別），已略過這幾筆。")
+
+    df = df[valid_mask].copy()
+    df = df.sort_values("date").reset_index(drop=True)
+    df["type_zh"] = df["type_norm"].map({"buy": "買進", "sell": "賣出"})
+    return df, warnings
+
+
+def compute_position_from_trades(trades: pd.DataFrame) -> dict:
+    """依「移動平均成本法」逐筆計算目前持股數與平均成本：買進時用加權平均更新成本，
+    賣出時不改變剩餘部位的平均成本，只實現損益。僅適用單一股票的交易紀錄。
+    """
+    shares = 0.0
+    avg_cost = 0.0
+    realized_pnl = 0.0
+    rows = []
+    for _, r in trades.iterrows():
+        shares_before = shares
+        if r["type_norm"] == "buy":
+            new_shares = shares + r["quantity"]
+            avg_cost = ((shares * avg_cost) + (r["quantity"] * r["price"])) / new_shares if new_shares > 0 else 0.0
+            shares = new_shares
+        else:  # sell
+            sell_qty = min(r["quantity"], shares) if shares > 0 else r["quantity"]
+            realized_pnl += (r["price"] - avg_cost) * sell_qty
+            shares = max(shares - r["quantity"], 0.0)
+        rows.append({
+            "date": r["date"], "type_zh": r["type_zh"], "price": float(r["price"]),
+            "quantity": float(r["quantity"]), "reason": r.get("reason", ""),
+            "shares_before": shares_before, "shares_after": shares,
+        })
+    return {
+        "current_shares": shares,
+        "avg_cost": avg_cost,
+        "realized_pnl": realized_pnl,
+        "trade_rows": rows,
+    }
+
+
+def check_portfolio_exposure(current_shares: float, latest_close: float,
+                              total_account_assets: float, cash_amount: float) -> dict:
+    """對照「單一股票最大曝險35%」與「現金防禦水位15%~20%」這兩項帳戶總體風控。
+    total_account_assets / cash_amount 為0時（使用者未填）視為「未提供」，不計算比例。
+    """
+    position_value = current_shares * latest_close
+    exposure_pct = (position_value / total_account_assets) if total_account_assets > 0 else None
+    cash_pct = (cash_amount / total_account_assets) if total_account_assets > 0 else None
+    return {
+        "position_value": position_value,
+        "exposure_pct": exposure_pct,
+        "exposure_over_cap": bool(exposure_pct is not None and exposure_pct > SINGLE_STOCK_MAX_EXPOSURE_PCT),
+        "cash_pct": cash_pct,
+        "cash_below_min": bool(cash_pct is not None and cash_pct < CASH_RESERVE_MIN_PCT),
+        "cash_in_band": bool(cash_pct is not None and CASH_RESERVE_MIN_PCT <= cash_pct <= CASH_RESERVE_MAX_PCT),
+        "cash_above_max": bool(cash_pct is not None and cash_pct > CASH_RESERVE_MAX_PCT),
+    }
+
+
+def classify_pyramid_buys(trade_rows: list, price_df: pd.DataFrame, target_total_position: float) -> list:
+    """針對交易紀錄中每一筆「買進」，比對當天（或最接近的前一個交易日）的技術指標，
+    嘗試歸類到使用者持倉規則的 A（逢低回測）／B（突破確認）型態，並檢查該筆加碼股數
+    是否超過「目標總倉位」的25%。
+
+    C（財報跳空缺口）型態需要「財報公布日期」資料，這支工具目前沒有串接財報行事曆，
+    無法自動判斷，一律標記為「無法自動判斷」，請使用者自行對照。
+    """
+    results = []
+    dates = price_df["date"]
+    for row in trade_rows:
+        if row["type_zh"] != "買進":
+            continue
+        buy_date = row["date"]
+        idx_candidates = price_df.index[dates <= buy_date]
+        if len(idx_candidates) == 0:
+            results.append({
+                **row, "match_status": "no_data",
+                "classification": "無資料（早於工具抓取的歷史資料範圍，無法比對當天技術指標）",
+                "addon_pct_of_target": (row["quantity"] / target_total_position) if target_total_position > 0 else None,
+                "addon_over_cap": bool(target_total_position > 0 and row["quantity"] / target_total_position > SINGLE_ADDON_MAX_PCT_OF_TARGET),
+            })
+            continue
+
+        idx = idx_candidates[-1]
+        prow = price_df.loc[idx]
+        close, open_ = prow["close"], prow["open"]
+        rsi = prow.get("rsi14")
+        ma20, ma50 = prow.get("ma20"), prow.get("ma50")
+        volume, vol_ma20 = prow.get("volume"), prow.get("volume_ma20")
+
+        near_ma20 = pd.notna(ma20) and ma20 > 0 and abs(close - ma20) / ma20 <= PYRAMID_A_MA_TOLERANCE_PCT
+        near_ma50 = pd.notna(ma50) and ma50 > 0 and abs(close - ma50) / ma50 <= PYRAMID_A_MA_TOLERANCE_PCT
+        type_a = bool((near_ma20 or near_ma50) and pd.notna(rsi) and rsi <= PYRAMID_A_RSI_MAX)
+
+        window_start = max(idx - PYRAMID_B_LOOKBACK_WIN, 0)
+        prior_high = price_df["high"].iloc[window_start:idx].max() if idx > window_start else np.nan
+        is_red_candle = close > open_
+        breakout = pd.notna(prior_high) and close > prior_high
+        volume_surge = pd.notna(vol_ma20) and vol_ma20 > 0 and pd.notna(volume) and volume > PYRAMID_B_VOLUME_MULTIPLE * vol_ma20
+        type_b = bool(is_red_candle and breakout and volume_surge)
+
+        if type_a and type_b:
+            classification = "同時符合 A（逢低回測）與 B（突破確認）"
+        elif type_a:
+            classification = "疑似符合 A：逢低回測買點"
+        elif type_b:
+            classification = "疑似符合 B：突破確認買點"
+        else:
+            classification = "未明顯符合 A 或 B（也可能是 C 財報型買點，此工具無法自動判斷財報日期，請自行確認）"
+
+        addon_pct_of_target = (row["quantity"] / target_total_position) if target_total_position > 0 else None
+        addon_pct_of_prior_shares = (row["quantity"] / row["shares_before"]) if row["shares_before"] > 0 else None
+
+        results.append({
+            **row,
+            "match_status": "ok",
+            "matched_date": prow["date"],
+            "classification": classification,
+            "type_a": type_a, "type_b": type_b,
+            "rsi_at_buy": rsi, "ma20_at_buy": ma20, "ma50_at_buy": ma50,
+            "addon_pct_of_target": addon_pct_of_target,
+            "addon_over_cap": bool(addon_pct_of_target is not None and addon_pct_of_target > SINGLE_ADDON_MAX_PCT_OF_TARGET),
+            "addon_pct_of_prior_shares": addon_pct_of_prior_shares,
+        })
+    return results
+
+
+def check_anti_fomo_buybacks(trade_rows: list) -> list:
+    """簡化版「反FOMO回補」檢查：只要賣出後 ANTI_FOMO_WINDOW_DAYS 天內，又用「更高的價格」
+    買回，就標記為「疑似追高回補」。
+
+    這是簡化版的通用判斷（賣出後短期內、價格更高的回補先一律標記），並非使用者原本規則裡
+    「允許執行的客觀回補條件」完整表格的精確還原（該表格內容這次沒有完整帶到文字裡）。
+    """
+    flags = []
+    sells = [r for r in trade_rows if r["type_zh"] == "賣出"]
+    buys = [r for r in trade_rows if r["type_zh"] == "買進"]
+    for s in sells:
+        window_end = s["date"] + pd.Timedelta(days=ANTI_FOMO_WINDOW_DAYS)
+        for b in buys:
+            if s["date"] < b["date"] <= window_end and b["price"] >= s["price"]:
+                flags.append({
+                    "sell_date": s["date"], "sell_price": s["price"], "sell_qty": s["quantity"],
+                    "buy_date": b["date"], "buy_price": b["price"], "buy_qty": b["quantity"],
+                    "days_between": (b["date"] - s["date"]).days,
+                    "price_diff_pct": ((b["price"] - s["price"]) / s["price"]) if s["price"] else None,
+                })
+    return flags
+
+
+def _fmt_portfolio_check_lines(portfolio_check: dict) -> str:
+    """把持倉風控與紀律檢核的結果，整理成給 Gemini 提示語與 Markdown 報告共用的條列文字。"""
+    pc = portfolio_check
+    lines = [
+        f"- 目前持股（依交易紀錄推算，移動平均成本法）：{pc['current_shares']:.0f} 股，"
+        f"平均成本 {pc['avg_cost']:.2f}，已實現損益 {pc['realized_pnl']:+.2f}",
+    ]
+
+    exp = pc.get("exposure_check")
+    if exp and exp.get("exposure_pct") is not None:
+        lines.append(
+            f"- 單一股票曝險：持股市值 {exp['position_value']:,.0f}，"
+            f"佔帳戶總資產 {exp['exposure_pct']:.1%}（上限35%）："
+            f"{'已超過上限' if exp['exposure_over_cap'] else '在上限之內'}"
+        )
+    else:
+        lines.append("- 單一股票曝險：使用者未提供帳戶總資產，無法計算")
+
+    if exp and exp.get("cash_pct") is not None:
+        lines.append(
+            f"- 現金防禦水位：佔帳戶總資產 {exp['cash_pct']:.1%}（常態目標15%~20%）："
+            f"{'低於下限' if exp['cash_below_min'] else ('高於上限' if exp['cash_above_max'] else '在常態區間內')}"
+        )
+    else:
+        lines.append("- 現金防禦水位：使用者未提供現金水位，無法計算")
+
+    pyramid = pc.get("pyramid_buys") or []
+    if pyramid:
+        lines.append(f"- 分批建倉型態比對（共 {len(pyramid)} 筆買進紀錄）：")
+        for p in pyramid:
+            over_cap_note = "；⚠️超過單次加碼25%上限" if p.get("addon_over_cap") else ""
+            lines.append(
+                f"  - {p['date'].date().isoformat()} 買進 {p['quantity']:.0f} 股 @ {p['price']:.2f}："
+                f"{p['classification']}{over_cap_note}"
+            )
+    else:
+        lines.append("- 分批建倉型態比對：無買進紀錄可比對")
+
+    fomo = pc.get("fomo_flags") or []
+    if fomo:
+        lines.append(f"- 反FOMO回補檢查：偵測到 {len(fomo)} 筆疑似「賣出後短期內追高回補」：")
+        for f in fomo:
+            lines.append(
+                f"  - {f['sell_date'].date().isoformat()} 賣出 @ {f['sell_price']:.2f} → "
+                f"{f['buy_date'].date().isoformat()}（{f['days_between']}天後）買回 @ {f['buy_price']:.2f}"
+                f"（{f['price_diff_pct']:+.1%}）"
+            )
+    else:
+        lines.append("- 反FOMO回補檢查：未偵測到賣出後短期內追高回補的紀錄")
+
+    return "\n".join(lines)
 
 
 def build_quick_recommendation(stats: dict):
@@ -1175,7 +1444,7 @@ def _fmt_quote(quote) -> str:
 
 
 def build_prompt(symbol, stats, start_date, end_date, trend=None, patterns=None,
-                  backtest=None, quote=None, stop_plan=None) -> str:
+                  backtest=None, quote=None, stop_plan=None, portfolio_check=None) -> str:
     """建構送給 Gemini 的分析提示語（單一個股獨立分析）。
 
     設計重點：
@@ -1188,6 +1457,10 @@ def build_prompt(symbol, stats, start_date, end_date, trend=None, patterns=None,
     trend = trend or {}
     patterns = patterns or []
     stop_plan_block = _fmt_stop_plan_lines(stop_plan) if stop_plan else "（本次未提供停損／停利機制資料）"
+    portfolio_block = (
+        _fmt_portfolio_check_lines(portfolio_check) if portfolio_check
+        else "（本次未上傳交易紀錄，無持倉風控與紀律檢核資料）"
+    )
 
     stock_block = f"""【{symbol} 統計數據（歷史技術指標資料更新至 {stats['latest_date'].date().isoformat()}）】
 - 即時報價（另一獨立來源，僅供對照現在價格，非技術指標依據）：{_fmt_quote(quote)}
@@ -1212,6 +1485,9 @@ def build_prompt(symbol, stats, start_date, end_date, trend=None, patterns=None,
 - 使用者自己的停損／停利機制（規則式計算，非AI生成，以下數字為畫面上實際顯示的數字，
   分析時必須直接引用這些數字，不可自行另外發明其他百分比或金額）：
 {stop_plan_block}
+- 使用者的持倉風控與紀律檢核（規則式計算，非AI生成，若顯示「未上傳交易紀錄」則代表
+  這次沒有這份資料，不要臆測數字）：
+{portfolio_block}
 """
 
     prompt = f"""你是一位專業的量化投資分析師，擅長技術面、型態面分析，並且非常重視統計證據而非空泛斷言。
@@ -1248,7 +1524,15 @@ def build_prompt(symbol, stats, start_date, end_date, trend=None, patterns=None,
   留意哪個價位，但仍只能描述「距離」與「情境」，不可給出「建議買進／賣出」之類的操作
   指令，也不可承諾價格一定會到達或跌破某個價位。
 
-## 4. 風險提醒
+## 4. 持倉風控與紀律檢核解讀
+若上方顯示「未上傳交易紀錄」，這一段只需要寫一句話說明本次未提供持倉資料、故略過，不要
+臆測或編造任何持股/曝險數字。若有提供資料，則針對「使用者的持倉風控與紀律檢核」裡已經算好
+的項目（單一股票曝險是否超過35%、現金水位是否在15%~20%常態區間、每筆加碼是否超過目標倉位
+25%上限、每筆加碼比較接近A/B哪個型態或屬於無法判斷、是否有疑似反FOMO回補的紀錄）逐項做
+情境說明，一樣禁止另外發明任何新的百分比或判斷標準；若曝險超過35%是因為股價上漲造成，提醒
+使用者這種情況依規則是「僅以追蹤停利調節、不主動猜頂」，不等於要立刻出清。
+
+## 5. 風險提醒
 列出根據目前數據看到的主要風險因子（如波動度偏高、回撤過大、RSI 已達極端區間、訊號樣本數過少等），
 並註明：本分析僅根據歷史技術指標、型態辨識與統計回測產生，技術指標為落後指標，不代表對未來（尤其是
 單一交易日）漲跌的預測，不構成投資建議，投資人應自行評估風險並諮詢專業意見。
@@ -1485,6 +1769,141 @@ def render_playbook_stop_plan(stop_plan: dict):
                "也不構成投資建議；實際執行仍請自行確認部位身份（新加碼／核心持倉）與基本面狀況。")
 
 
+def render_portfolio_discipline_section(symbol: str, price_df: pd.DataFrame):
+    """選填區塊：使用者上傳自己的交易紀錄 CSV，並手動輸入帳戶總資產／現金水位／目標總倉位，
+    才會顯示「單一股票最大曝險35%」「現金防禦率15%~20%」「單次加碼上限25%」「分批建倉A/B/C型態」
+    「反FOMO回補紀律」這幾項需要知道實際持倉狀態才能判斷的規則（範本第一、二、四節）。
+
+    不上傳交易紀錄的話，這個區塊只顯示說明文字，不影響上方原本的個股技術面分析。
+    回傳 portfolio_check dict（供 AI 分析與下載報告引用）；未上傳交易紀錄時回傳 None。
+    """
+    st.markdown("##### 📊 持倉風控與紀律檢核（選填功能）")
+    st.caption(
+        f"以下需要你上傳自己的 {symbol} 交易紀錄 CSV，才能算出「單一股票曝險」「加碼比例」"
+        "「分批建倉型態」「反FOMO回補」這幾項——這支工具本身不記得你的持倉狀態，"
+        "每次分析都需要重新上傳（不會存到雲端）。不上傳的話完全不影響上方的技術面分析。"
+    )
+
+    trade_file = st.file_uploader(
+        f"上傳 {symbol} 的交易紀錄 CSV（欄位：Date, Type, Symbol, Name, Price, Quantity, Reason）",
+        type=["csv"], key="trade_log_uploader",
+    )
+
+    colp1, colp2, colp3 = st.columns(3)
+    with colp1:
+        total_account_assets = st.number_input(
+            "帳戶總資產（所有持股＋現金，選填）", min_value=0.0, value=0.0, step=1000.0,
+            help="用於「單一股票最大曝險35%」與「現金防禦水位15%~20%」這兩項的計算基準；留空或填0則不計算這兩項。",
+        )
+    with colp2:
+        cash_amount = st.number_input(
+            "目前現金／高流動資產水位（選填）", min_value=0.0, value=0.0, step=1000.0,
+        )
+    with colp3:
+        target_total_position = st.number_input(
+            f"{symbol} 目標總倉位（股數，選填）", min_value=0.0, value=0.0, step=1.0,
+            help="用於「單次加碼上限不得超過目標總倉位25%」的計算基準；留空或填0則不計算這一項。",
+        )
+
+    if trade_file is None:
+        st.info("尚未上傳交易紀錄，以上四個欄位可先不用理會。")
+        return None
+
+    try:
+        raw = pd.read_csv(trade_file)
+        trades, warns = parse_trade_log(raw)
+    except Exception as exc:
+        st.error(f"交易紀錄讀取失敗：{exc}")
+        return None
+
+    for w in warns:
+        st.warning(w)
+    if len(trades) == 0:
+        st.error("交易紀錄裡沒有看得懂的買賣紀錄，請確認欄位格式（Date/Type/Price/Quantity 是否正確）。")
+        return None
+
+    position = compute_position_from_trades(trades)
+    latest_close = float(price_df["close"].iloc[-1])
+    exposure_check = check_portfolio_exposure(
+        position["current_shares"], latest_close, total_account_assets, cash_amount
+    )
+    pyramid_buys = classify_pyramid_buys(position["trade_rows"], price_df, target_total_position)
+    fomo_flags = check_anti_fomo_buybacks(position["trade_rows"])
+
+    st.markdown("**目前持股（依交易紀錄推算，移動平均成本法）**")
+    pc1, pc2, pc3, pc4 = st.columns(4)
+    pc1.metric("目前股數", f"{position['current_shares']:.0f}")
+    pc2.metric("平均成本", f"${position['avg_cost']:.2f}")
+    pc3.metric("持股市值（依最新收盤價）", f"${exposure_check['position_value']:,.0f}")
+    pc4.metric("已實現損益", f"${position['realized_pnl']:+,.0f}")
+
+    st.markdown("**① 單一股票曝險 ／ 現金防禦水位**")
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        if exposure_check["exposure_pct"] is not None:
+            over = exposure_check["exposure_over_cap"]
+            st.metric("佔帳戶總資產比重（上限35%）", f"{exposure_check['exposure_pct']:.1%}")
+            if over:
+                st.warning("已超過35%上限。若是股價上漲導致市值變大，依你的規則「僅以追蹤停利調節，不主動猜頂」，"
+                           "不代表要馬上出清；若是加碼買進造成的，則要留意是否過度集中。")
+            else:
+                st.success("在35%上限之內。")
+        else:
+            st.info("未提供帳戶總資產，無法計算單一股票曝險比重。")
+    with ec2:
+        if exposure_check["cash_pct"] is not None:
+            st.metric("現金佔帳戶總資產比重（常態目標15%~20%）", f"{exposure_check['cash_pct']:.1%}")
+            if exposure_check["cash_below_min"]:
+                st.warning("低於15%下限，可留意的防禦資金可能偏少。")
+            elif exposure_check["cash_above_max"]:
+                st.info("高於20%，防禦資金水位偏寬鬆。")
+            else:
+                st.success("在15%~20%常態區間內。")
+        else:
+            st.info("未提供現金水位，無法計算現金防禦率。")
+
+    st.markdown("**② 分批建倉型態比對（依買進當天技術指標，回溯判斷）**")
+    if pyramid_buys:
+        for p in pyramid_buys:
+            over_cap = p.get("addon_over_cap")
+            addon_pct = p.get("addon_pct_of_target")
+            label = f"{p['date'].date().isoformat()}　買進 {p['quantity']:.0f} 股 @ ${p['price']:.2f}"
+            detail = p["classification"]
+            if addon_pct is not None:
+                detail += f"；佔目標總倉位 {addon_pct:.1%}"
+            if over_cap:
+                st.warning(f"{label}\n\n{detail}　⚠️超過單次加碼25%上限")
+            else:
+                st.info(f"{label}\n\n{detail}")
+        st.caption("C（財報跳空缺口）型態需要財報公布日期資料，此工具尚未串接財報行事曆，"
+                   "無法自動判斷，「未明顯符合A或B」的買進也可能屬於C型態，請自行對照。")
+    else:
+        st.caption("交易紀錄中沒有買進紀錄可比對。")
+
+    st.markdown("**④ 反FOMO回補檢查（簡化版）**")
+    if fomo_flags:
+        for f in fomo_flags:
+            st.warning(
+                f"{f['sell_date'].date().isoformat()} 賣出 @ ${f['sell_price']:.2f} → "
+                f"{f['buy_date'].date().isoformat()}（{f['days_between']}天後）用更高價格 "
+                f"${f['buy_price']:.2f}（{f['price_diff_pct']:+.1%}）買回，疑似追高回補。"
+            )
+    else:
+        st.success("未偵測到「賣出後短期內用更高價格買回」的紀錄。")
+    st.caption("這是簡化版的通用判斷（賣出後3天內、價格更高的回補先一律標記出來），"
+               "並非你原本規則裡「允許執行的客觀回補條件」完整表格的精確還原——如果你想要更精準比對，"
+               "麻煩把那份表格的實際內容貼給我，我再調整判斷邏輯。")
+
+    return {
+        "current_shares": position["current_shares"],
+        "avg_cost": position["avg_cost"],
+        "realized_pnl": position["realized_pnl"],
+        "exposure_check": exposure_check,
+        "pyramid_buys": pyramid_buys,
+        "fomo_flags": fomo_flags,
+    }
+
+
 def render_stock_section(symbol, color, df, stats, trend, patterns, backtest, stop_plan,
                           quote=None, quote_error=None):
     """單一個股的完整分析區塊：即時報價 → 技術指標圖 → 型態分析 → 訊號回測 → 投資建議與風險評估。"""
@@ -1546,13 +1965,18 @@ def render_stock_section(symbol, color, df, stats, trend, patterns, backtest, st
 
 
 def build_markdown_report(symbol, stats, start_date, end_date, ai_analysis: str,
-                           trend=None, patterns=None, backtest=None, quote=None, stop_plan=None) -> str:
+                           trend=None, patterns=None, backtest=None, quote=None, stop_plan=None,
+                           portfolio_check=None) -> str:
     trend = trend or {}
     patterns = patterns or []
 
     level, level_kind = assess_risk_level(stats)
     action, reasons, _ = build_quick_recommendation(stats)
     stop_plan_block = _fmt_stop_plan_lines(stop_plan) if stop_plan else "（本次未提供停損／停利機制資料）"
+    portfolio_block = (
+        _fmt_portfolio_check_lines(portfolio_check) if portfolio_check
+        else "（本次未上傳交易紀錄，無持倉風控與紀律檢核資料）"
+    )
 
     lines = [
         f"# 股票分析評估報告：{symbol}",
@@ -1563,6 +1987,8 @@ def build_markdown_report(symbol, stats, start_date, end_date, ai_analysis: str,
         "".join(f"\n  - {r}" for r in reasons),
         f"\n\n## 停損／停利機制（依你的持倉規則計算）\n",
         stop_plan_block,
+        f"\n\n## 持倉風控與紀律檢核（依你的交易紀錄計算）\n",
+        portfolio_block,
         f"\n\n## 趨勢與型態\n",
         f"- 趨勢：{trend.get('trend', 'N/A')}；均線排列：{stats['ma_alignment']}；"
         f"布林通道：{stats['bb_position']}；KD：{stats['kd_cross']}（{stats['kd_signal']}）"
@@ -1754,6 +2180,9 @@ def main():
                           quote=quote, quote_error=quote_err)
 
     st.markdown("---")
+    portfolio_check = render_portfolio_discipline_section(symbol, df)
+
+    st.markdown("---")
     st.header("🤖 AI 分析")
     if not gemini_key:
         st.warning("請先在左側輸入 Gemini API 金鑰才能產生 AI 分析。")
@@ -1761,7 +2190,7 @@ def main():
         with st.spinner("正在請 Gemini 進行分析，請稍候..."):
             prompt = build_prompt(symbol, stats, start_date, end_date,
                                    trend=trend, patterns=patterns, backtest=backtest, quote=quote,
-                                   stop_plan=stop_plan)
+                                   stop_plan=stop_plan, portfolio_check=portfolio_check)
             try:
                 analysis = call_gemini(prompt, gemini_key, gemini_model)
             except Exception as exc:
@@ -1772,7 +2201,7 @@ def main():
             st.markdown(analysis, unsafe_allow_html=True)
             report_md = build_markdown_report(symbol, stats, start_date, end_date, analysis,
                                                trend=trend, patterns=patterns, backtest=backtest,
-                                               quote=quote, stop_plan=stop_plan)
+                                               quote=quote, stop_plan=stop_plan, portfolio_check=portfolio_check)
             st.download_button(
                 "📥 下載完整分析報告（Markdown）",
                 data=report_md.encode("utf-8"),
