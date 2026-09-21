@@ -75,9 +75,23 @@ FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata
 
 TRADING_DAYS_PER_YEAR = 252
 RISK_FREE_RATE = 0.0  # Sharpe Ratio 固定以 0% 無風險利率計算（即年化報酬／年化波動度）
-HISTORY_LOOKBACK_DAYS = 365  # 不再讓使用者輸入日期區間，固定往回抓一年資料算技術指標
+# 原本固定抓365天（約52週），改成420天（約60週），多留一點緩衝，確保下面
+# 「整體核心持倉防禦停損」需要用到的「週線50週均線」在資料剛好卡在邊界時
+# 也能算出有效數值（50週均線至少需要50根週K棒才有值）。
+HISTORY_LOOKBACK_DAYS = 420
 
 STOCK_COLOR = "#2563eb"
+
+# --- 使用者個人持倉停損／停利機制（取代原本「距目前收盤價的固定百分比」算法）---
+# 依使用者提供的《NVDA 持倉管理與交易規則範本》第三節「出場、停損與追蹤停利機制」，
+# 這是使用者自己的量化紀律，並非依風險等級（保守/穩健/積極）浮動調整的通用估算值，
+# 所以底下改成單一套固定規則，取代原本按風險等級給不同百分比的做法。
+NEW_POSITION_STOP_LOSS_PCT = 0.07      # 新加碼部位：買入成本價（此處以目前收盤價為進場參考價）跌破 -7% 無條件停損
+WEEKLY_DEFENSE_MA_WINDOW = 50          # 整體核心持倉防禦停損：週線的 50 週均線
+WEEKLY_DEFENSE_CONFIRM_DAYS = 3        # 跌破後，最近 N 個交易日收盤都未收復才視為「確認」
+STAGE1_TAKE_PROFIT_SELL_PCT = 0.20     # 第一階段（鎖定獲利）：達目標價時最多賣出的比例，其餘續抱
+TRAILING_STOP_MA_WINDOW = 20           # 第二階段（追蹤停利）：只要收盤守住這條均線之上就全程持有
+TRAILING_STOP_SELL_PCT = 0.30          # 第二階段：收盤實體跌破上述均線時，調節的持股比例
 
 # 新聞情緒五級分類配色（Bearish=深紅 ～ Bullish=深綠，符合金融情緒分析慣例配色）
 SENTIMENT_LABELS_ORDER = ["Bearish", "Somewhat-Bearish", "Neutral", "Somewhat-Bullish", "Bullish"]
@@ -627,57 +641,139 @@ def assess_risk_level(stats: dict):
         return "高風險", "high"
 
 
-def suggest_stop_prices(latest_close: float, risk_kind: str) -> dict:
-    """依風險等級與目前收盤價（作為進場參考價），直接換算出停損／停利的實際股價，
-    而不是只回傳百分比，讓使用者可以直接對照掛單金額（一般經驗法則，非精算）。
+def check_weekly_ma50_defense_stop(df: pd.DataFrame) -> dict:
+    """判斷「整體核心持倉防禦停損」是否觸發：週線收盤跌破 50 週均線，且最近
+    WEEKLY_DEFENSE_CONFIRM_DAYS 個交易日的收盤都未收復回這條均線之上。
+
+    這裡的「3日未收復」解讀為：50週均線的位置變動很慢，所以拿「最新一根週K棒
+    算出來的50週均線水位」當基準線，檢查最近3個交易日的『日收盤價』是否都還在
+    這條線之下──只要有任何一天收盤收回到線之上，就視為尚未confirmed（仍在
+    觀察，不代表規則失效），這是對文字規則的具體化解讀，並非唯一可能的解讀方式。
+
+    50週均線至少需要50根有效的週K棒才算得出來；資料不足時回傳
+    status='insufficient_data'，呼叫端應顯示提醒文字，不中斷其他分析。
     """
-    pct_mapping = {
-        "low": {"stop_loss_pct": 0.08, "take_profit_pct_low": 0.15, "take_profit_pct_high": 0.20},
-        "mid": {"stop_loss_pct": 0.12, "take_profit_pct_low": 0.20, "take_profit_pct_high": 0.25},
-        "high": {"stop_loss_pct": 0.18, "take_profit_pct_low": 0.25, "take_profit_pct_high": 0.30},
+    weekly_close = df.set_index("date")["close"].resample("W-FRI").last().dropna()
+    if len(weekly_close) < WEEKLY_DEFENSE_MA_WINDOW:
+        return {"status": "insufficient_data", "weeks_available": int(len(weekly_close))}
+
+    weekly_ma = weekly_close.rolling(WEEKLY_DEFENSE_MA_WINDOW, min_periods=WEEKLY_DEFENSE_MA_WINDOW).mean()
+    latest_weekly_ma = weekly_ma.iloc[-1]
+    if pd.isna(latest_weekly_ma):
+        return {"status": "insufficient_data", "weeks_available": int(len(weekly_close))}
+
+    latest_weekly_close = weekly_close.iloc[-1]
+    weekly_broken = latest_weekly_close < latest_weekly_ma
+
+    last_n_daily_close = df["close"].tail(WEEKLY_DEFENSE_CONFIRM_DAYS)
+    has_enough_days = len(last_n_daily_close) >= WEEKLY_DEFENSE_CONFIRM_DAYS
+    reclaimed = bool((last_n_daily_close > latest_weekly_ma).any())
+    confirmed = bool(weekly_broken and has_enough_days and not reclaimed)
+
+    return {
+        "status": "ok",
+        "weekly_ma": float(latest_weekly_ma),
+        "latest_weekly_close": float(latest_weekly_close),
+        "weekly_broken": bool(weekly_broken),
+        "confirmed": confirmed,
+        "weeks_available": int(len(weekly_close)),
     }
-    p = pct_mapping.get(risk_kind, pct_mapping["mid"])
+
+
+def compute_playbook_stop_plan(df: pd.DataFrame, trend: dict, custom_target_price: float = None) -> dict:
+    """依使用者自己的持倉停損／停利機制（取代原本「距目前收盤價的固定百分比」算法），
+    直接換算出實際股價與目前是否已觸發，而不是只給一組通用的風險等級百分比：
+
+    停損（兩條防線，分別對應不同身份，兩者都會顯示）：
+      1. 新加碼部位：進場參考價（此處以目前收盤價代入）跌破 NEW_POSITION_STOP_LOSS_PCT
+         （-7%）無條件停損。
+      2. 整體核心持倉：週線跌破50週均線，且最近3個交易日收盤都未收復
+         （見 check_weekly_ma50_defense_stop）。「若基本面未變」這個前提屬於質化判斷，
+         本工具無法量化，僅在文字說明中提醒使用者自行確認。
+
+    停利（分兩階段，非固定金額）：
+      第一階段：股價達到「階段目標價」（可由使用者自訂；留空則以近期壓力價／前高為準）
+                時，最多賣出 STAGE1_TAKE_PROFIT_SELL_PCT（20%），其餘續抱。
+      第二階段（追蹤停利）：剩餘部位只要收盤守住 TRAILING_STOP_MA_WINDOW 日均線
+                （20MA）之上就全程持有、不設停利上限；收盤跌破才調節
+                TRAILING_STOP_SELL_PCT（30%）。
+    """
+    latest_close = float(df["close"].iloc[-1])
+    ma_col = f"ma{TRAILING_STOP_MA_WINDOW}"
+    trailing_ma = float(df[ma_col].iloc[-1]) if ma_col in df.columns else None
+
+    new_position_stop_loss_price = latest_close * (1 - NEW_POSITION_STOP_LOSS_PCT)
+
+    weekly_defense = check_weekly_ma50_defense_stop(df)
+
+    resistance = (trend or {}).get("resistance")
+    if custom_target_price is not None and custom_target_price > 0:
+        stage1_target = float(custom_target_price)
+        stage1_target_source = "使用者自訂目標價"
+    elif resistance is not None and not pd.isna(resistance):
+        stage1_target = float(resistance)
+        stage1_target_source = "近期壓力價（近期高點，自動估算，非使用者自訂）"
+    else:
+        stage1_target = None
+        stage1_target_source = None
+    stage1_reached = bool(stage1_target is not None and latest_close >= stage1_target)
+
+    trailing_broken = bool(trailing_ma is not None and not pd.isna(trailing_ma) and latest_close < trailing_ma)
+
     return {
         "entry_ref_price": latest_close,
-        "stop_loss_pct": p["stop_loss_pct"],
-        "stop_loss_price": latest_close * (1 - p["stop_loss_pct"]),
-        "take_profit_pct_low": p["take_profit_pct_low"],
-        "take_profit_pct_high": p["take_profit_pct_high"],
-        "take_profit_price_low": latest_close * (1 + p["take_profit_pct_low"]),
-        "take_profit_price_high": latest_close * (1 + p["take_profit_pct_high"]),
+        "new_position_stop_loss_pct": NEW_POSITION_STOP_LOSS_PCT,
+        "new_position_stop_loss_price": new_position_stop_loss_price,
+        "weekly_defense": weekly_defense,
+        "stage1_target": stage1_target,
+        "stage1_target_source": stage1_target_source,
+        "stage1_sell_pct": STAGE1_TAKE_PROFIT_SELL_PCT,
+        "stage1_reached": stage1_reached,
+        "trailing_ma": trailing_ma,
+        "trailing_ma_window": TRAILING_STOP_MA_WINDOW,
+        "trailing_broken": trailing_broken,
+        "trailing_sell_pct": TRAILING_STOP_SELL_PCT,
     }
 
 
-def check_take_profit_vs_resistance(stop_info: dict, trend: dict) -> str:
-    """比較「規則式停利目標」與「近期壓力價」，若停利目標高於壓力價則回傳警示文字。
+def _fmt_stop_plan_lines(stop_plan: dict) -> str:
+    """把 compute_playbook_stop_plan() 的結果，整理成給 Gemini 提示語與
+    Markdown 報告共用的條列文字，確保 AI 看到的數字跟畫面上顯示的完全一致。"""
+    sp = stop_plan
+    wd = sp["weekly_defense"]
 
-    這兩個數字是完全獨立的計算方式：停利目標＝目前收盤價 × 固定百分比（依風險等級），
-    壓力價＝近N日高點（detect_trend_pattern 依線性回歸與近期高低點估算）。兩者本來就
-    不保證一致；當停利目標高於壓力價時，代表要達到停利目標，股價必須先突破壓力價，
-    可信度需要打折扣，因此在畫面上額外加註提醒，而不去強行更動任何一邊的計算公式。
-    """
-    resistance = (trend or {}).get("resistance")
-    if resistance is None or pd.isna(resistance):
-        return None
+    if wd["status"] == "insufficient_data":
+        weekly_line = f"歷史資料僅約 {wd['weeks_available']} 週，尚不足50週，暫無法計算"
+    elif wd["confirmed"]:
+        weekly_line = (f"已觸發（週收盤 {wd['latest_weekly_close']:.2f} 跌破50週均線 "
+                        f"{wd['weekly_ma']:.2f}，且最近{WEEKLY_DEFENSE_CONFIRM_DAYS}個交易日收盤都未收復）")
+    elif wd["weekly_broken"]:
+        weekly_line = (f"觀察中（週收盤 {wd['latest_weekly_close']:.2f} 已跌破50週均線 "
+                        f"{wd['weekly_ma']:.2f}，但尚未滿足3日未收復的確認條件）")
+    else:
+        weekly_line = f"未觸發（週收盤 {wd['latest_weekly_close']:.2f} 仍在50週均線 {wd['weekly_ma']:.2f} 之上）"
 
-    tp_low = stop_info["take_profit_price_low"]
-    tp_high = stop_info["take_profit_price_high"]
+    if sp["stage1_target"] is not None:
+        stage1_line = (f"{sp['stage1_target']:.2f}（來源：{sp['stage1_target_source']}；"
+                        f"{'已達標' if sp['stage1_reached'] else '尚未達標'}，"
+                        f"達標時最多賣出{sp['stage1_sell_pct']:.0%}，其餘續抱）")
+    else:
+        stage1_line = "尚無法自動估算（近期高低點資料不足，使用者也未自訂目標價）"
 
-    if tp_low > resistance:
-        return (
-            f"⚠️ 停利目標（${tp_low:.2f}～${tp_high:.2f}）已高於近期壓力價 ${resistance:.2f}。"
-            "停利目標是「目前收盤價 × 固定百分比」直接換算出來的，壓力價則是依近期高低點另外"
-            "估算的，兩者計算方式互相獨立、本來就不保證一致。這代表要達到停利目標，股價必須"
-            "先向上突破壓力價、且漲勢能延續下去，可信度需要打折扣，並非保證能到達的價位。"
-        )
-    if tp_high > resistance:
-        return (
-            f"⚠️ 停利目標上緣（${tp_high:.2f}）已高於近期壓力價 ${resistance:.2f}，下緣"
-            f"（${tp_low:.2f}）則尚未突破。兩者為互相獨立的計算方式（停利目標＝收盤價×固定"
-            "百分比；壓力價＝近期高低點估算），若股價在壓力價附近遇阻回落，上緣目標的可信度"
-            "需要打折扣。"
-        )
-    return None
+    if sp["trailing_ma"] is not None:
+        trailing_line = (f"{TRAILING_STOP_MA_WINDOW}日均線 {sp['trailing_ma']:.2f}，"
+                          f"目前{'已跌破，達調節條件' if sp['trailing_broken'] else '收盤仍守住均線之上，維持持有'}，"
+                          f"跌破時調節{sp['trailing_sell_pct']:.0%}，未跌破則不設停利上限")
+    else:
+        trailing_line = "均線資料不足，暫無法計算"
+
+    return (
+        f"- 停損①新加碼部位（進場參考價 {sp['entry_ref_price']:.2f} 跌破 -{sp['new_position_stop_loss_pct']:.0%}）："
+        f"{sp['new_position_stop_loss_price']:.2f}\n"
+        f"- 停損②整體核心持倉防禦（週線50週均線+3日未收復，前提為基本面未變）：{weekly_line}\n"
+        f"- 停利①第一階段目標價：{stage1_line}\n"
+        f"- 停利②第二階段追蹤停利：{trailing_line}"
+    )
 
 
 def build_quick_recommendation(stats: dict):
@@ -1079,17 +1175,19 @@ def _fmt_quote(quote) -> str:
 
 
 def build_prompt(symbol, stats, start_date, end_date, trend=None, patterns=None,
-                  backtest=None, quote=None) -> str:
+                  backtest=None, quote=None, stop_plan=None) -> str:
     """建構送給 Gemini 的分析提示語（單一個股獨立分析）。
 
     設計重點：
       1. 明確角色設定（量化分析師）與適用範圍限制（僅根據歷史技術指標，非投資建議）。
       2. 提供結構化數據，避免模型自行臆測或幻覺產生數字。
       3. 明確要求引用「訊號回測」的歷史勝率數字，避免對單一訊號過度自信地斷言多空方向。
-      4. 針對不同風險偏好給出「具體、可執行」的停損／停利與觀察重點，而非空泛描述。
+      4. 停損／停利直接引用 compute_playbook_stop_plan() 算出的實際數字（使用者自己的
+         持倉規則），不再讓 AI 自行發明百分比，避免畫面上的規則式數字跟 AI 文字互相矛盾。
     """
     trend = trend or {}
     patterns = patterns or []
+    stop_plan_block = _fmt_stop_plan_lines(stop_plan) if stop_plan else "（本次未提供停損／停利機制資料）"
 
     stock_block = f"""【{symbol} 統計數據（歷史技術指標資料更新至 {stats['latest_date'].date().isoformat()}）】
 - 即時報價（另一獨立來源，僅供對照現在價格，非技術指標依據）：{_fmt_quote(quote)}
@@ -1111,6 +1209,9 @@ def build_prompt(symbol, stats, start_date, end_date, trend=None, patterns=None,
 - 近期K線型態：{_fmt_patterns(patterns)}
 - 訊號歷史回測（隔日上漲機率）：
 {_fmt_backtest(backtest)}
+- 使用者自己的停損／停利機制（規則式計算，非AI生成，以下數字為畫面上實際顯示的數字，
+  分析時必須直接引用這些數字，不可自行另外發明其他百分比或金額）：
+{stop_plan_block}
 """
 
     prompt = f"""你是一位專業的量化投資分析師，擅長技術面、型態面分析，並且非常重視統計證據而非空泛斷言。
@@ -1132,27 +1233,20 @@ def build_prompt(symbol, stats, start_date, end_date, trend=None, patterns=None,
 訊號過去的實際命中率是否明顯優於基準勝率、樣本數是否足夠，藉此評估目前訊號的可信度高低，避免對任何
 單一訊號做出過度自信的斷言。
 
-## 3. 分級操作建議
-請針對「保守型」「穩健型」「積極型」三種風險偏好投資人分別給出建議，且每一級都必須「以下列
-格式的三級標題開頭」（標題文字請完全比照，不要更動用字或順序）：
-### 保守型
-### 穩健型
-### 積極型
-每個標題底下各給出：
-- 進場時機的具體判斷依據（引用 RSI / MACD / KD 訊號與其歷史勝率）
-- 停損 / 停利價位：請以上方最新收盤價 {_fmt_num(stats['latest_close'])} 作為進場參考價，直接換算成
-  實際股價金額（例如「停損價約為 $XXX.XX，較進場價下跌約 X.X%」「停利目標約為 $XXX.XX，較進場價
-  上漲約 X.X%」），不要只給百分比，必須讓使用者能直接對照實際掛單金額
-
-重要限制（務必遵守，避免三個等級的數字互相矛盾）：
-- 三個等級的停損／停利百分比必須呈現「風險遞增」的合理排序：保守型的停損百分比最小、停利目標
-  百分比也最小（最早獲利了結、最快停損出場）；穩健型居中；積極型的停損百分比最大（能承受較大
-  波動）、停利目標百分比也最大（願意持有更久以博取更大漲幅）。
-- 禁止保守型與積極型使用完全相同的停利或停損金額，也不可以讓保守型的停利目標高於或等於積極型。
-- 若某個等級的停利／停損目標剛好等於或非常接近上方提供的壓力價／支撐價，請在文字中明確指出
-  這件事（例如「此停利目標即為近期壓力價，突破前可能面臨賣壓」），不要讓數字巧合到卻完全不
-  說明。
-每一級的建議都必須具體到可以直接執行，避免「請自行斟酌」這類空泛用語。
+## 3. 停損／停利機制解讀
+上方「使用者自己的停損／停利機制」已經是規則式算好的實際數字，這一段只需要針對這些
+「已知數字」做解讀與情境說明，禁止另外發明任何其他百分比、金額或風險等級（不要出現
+「保守型／穩健型／積極型」這類分級）：
+- 逐項說明目前四個狀態（新加碼部位停損、整體核心持倉防禦停損、第一階段停利目標、
+  第二階段追蹤停利）距離目前股價各自還有多少空間（用百分比描述即可，數字必須跟上方
+  提供的金額換算一致），以及目前分別處於「未觸發／觀察中／已觸發」的哪個狀態。
+- 若「整體核心持倉防禦停損」目前是「觀察中」或「已觸發」，明確提醒使用者這條規則的前提
+  是「基本面未變（ROE／營收維持強勁）」，本分析無法評估基本面，請使用者自行確認。
+- 若第一階段停利目標的來源是「近期壓力價（自動估算）」而非使用者自訂，明確提醒這個目標
+  是用近期高低點估算出來的，並非使用者原本設定的實際目標價，僅供參考。
+- 結合上方 RSI／MACD／KD／均線等技術訊號，說明目前比較接近觸發哪一條規則、值得優先
+  留意哪個價位，但仍只能描述「距離」與「情境」，不可給出「建議買進／賣出」之類的操作
+  指令，也不可承諾價格一定會到達或跌破某個價位。
 
 ## 4. 風險提醒
 列出根據目前數據看到的主要風險因子（如波動度偏高、回撤過大、RSI 已達極端區間、訊號樣本數過少等），
@@ -1191,41 +1285,6 @@ def call_gemini(prompt: str, api_key: str, model: str = "gemini-3.5-flash-lite")
         return "".join(p.get("text", "") for p in parts)
     except (KeyError, IndexError) as exc:
         raise RuntimeError(f"無法解析 Gemini 回傳內容：{json.dumps(data, ensure_ascii=False)[:500]}") from exc
-
-
-# 「分級操作建議」三個風險等級標題的放大字級與區分色（保守=綠／穩健=橘／積極=紅，
-# 由保守到積極呈現「風險溫度」由冷到熱的直覺配色）。
-RISK_LEVEL_STYLES = {
-    "保守型": {"color": "#16a34a", "emoji": "🟢"},
-    "穩健型": {"color": "#d97706", "emoji": "🟡"},
-    "積極型": {"color": "#dc2626", "emoji": "🔴"},
-}
-
-
-def style_risk_level_headings(markdown_text: str) -> str:
-    """將 Gemini 回傳文字中「保守型／穩健型／積極型」的標題行，換成字級加大一號、
-    依風險等級上色的 HTML 標題，方便使用者一眼區分三種風險偏好的建議段落。
-
-    採用寬鬆比對（只要一行開頭附近出現關鍵字、且該行不長，就視為標題行），
-    避免因為 AI 每次回傳的標題格式（### / ** / 純文字）略有不同而抓不到；
-    若 AI 這次沒有用到這些關鍵字當標題，原文則不受影響、照樣正常顯示。
-    """
-    lines = markdown_text.split("\n")
-    out = []
-    for line in lines:
-        stripped = line.strip()
-        head = stripped[:12]
-        matched = next(((name, style) for name, style in RISK_LEVEL_STYLES.items() if name in head), None)
-        if matched and len(stripped) < 60:
-            name, style = matched
-            bare_text = stripped.lstrip("#*0123456789. 　-").rstrip("*： :")
-            out.append(
-                f'<div style="font-size:1.3rem;font-weight:800;color:{style["color"]};'
-                f'margin:0.7em 0 0.3em 0;">{style["emoji"]} {bare_text}</div>'
-            )
-        else:
-            out.append(line)
-    return "\n".join(out)
 
 
 def build_news_summary_prompt(symbol: str, news_stats: dict, news_list: list, fg: dict = None) -> str:
@@ -1367,7 +1426,67 @@ def render_realtime_quote(symbol, quote, error_msg=None):
                "仍是根據歷史每日收盤價計算，兩者為互補的獨立資訊，並非同一組數字。")
 
 
-def render_stock_section(symbol, color, df, stats, trend, patterns, backtest, quote=None, quote_error=None):
+def render_playbook_stop_plan(stop_plan: dict):
+    """顯示依使用者持倉規則算出的停損／停利機制（取代原本的固定百分比區塊）。"""
+    st.markdown("##### 📋 停損／停利機制（依你的持倉規則計算，不需呼叫 AI）")
+
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        st.markdown("**🛑 停損**")
+        st.metric(
+            "① 新加碼部位停損（-7%）",
+            f"${stop_plan['new_position_stop_loss_price']:.2f}",
+            f"-{stop_plan['new_position_stop_loss_pct']:.0%}",
+        )
+        st.caption(f"以目前收盤價 ${stop_plan['entry_ref_price']:.2f} 作為進場參考價換算；"
+                   "若這是你這次新加碼的部位，成本價跌破這個價位就無條件停損。")
+
+        wd = stop_plan["weekly_defense"]
+        if wd["status"] == "insufficient_data":
+            st.info(f"② 整體核心持倉防禦停損：歷史資料僅約 {wd['weeks_available']} 週，"
+                    "還不足 50 週，暫時無法計算週線 50 週均線，累積更多資料後會自動出現。")
+        else:
+            if wd["confirmed"]:
+                st.error(f"② 整體核心持倉防禦停損：**已觸發**（週收盤 ${wd['latest_weekly_close']:.2f} "
+                          f"跌破 50 週均線 ${wd['weekly_ma']:.2f}，且最近 {WEEKLY_DEFENSE_CONFIRM_DAYS} "
+                          "個交易日收盤都未收復）")
+            elif wd["weekly_broken"]:
+                st.warning(f"② 整體核心持倉防禦停損：**觀察中**（週收盤 ${wd['latest_weekly_close']:.2f} "
+                            f"已跌破 50 週均線 ${wd['weekly_ma']:.2f}，但最近幾個交易日收盤尚有收復，"
+                            "未滿足「3日未收復」的確認條件）")
+            else:
+                st.success(f"② 整體核心持倉防禦停損：**未觸發**（週收盤 ${wd['latest_weekly_close']:.2f} "
+                            f"仍在 50 週均線 ${wd['weekly_ma']:.2f} 之上）")
+            st.caption("這條防線的前提是「基本面未變（ROE／營收維持強勁）」，屬於質化判斷，"
+                       "本工具無法自動評估，觸發前請自行確認基本面是否仍然穩健。")
+
+    with sc2:
+        st.markdown("**🎯 停利（分階段，非固定金額）**")
+        if stop_plan["stage1_target"] is not None:
+            reached = "✅ 已達標" if stop_plan["stage1_reached"] else "尚未達標"
+            st.metric(f"① 第一階段目標價（{reached}）",
+                       f"${stop_plan['stage1_target']:.2f}",
+                       f"最多賣出 {stop_plan['stage1_sell_pct']:.0%}，其餘續抱")
+            st.caption(f"目標價來源：{stop_plan['stage1_target_source']}。")
+        else:
+            st.info("① 第一階段目標價：尚無法自動估算（近期高低點資料不足），可在上方欄位自行填入目標價。")
+
+        if stop_plan["trailing_ma"] is not None:
+            status = "⚠️ 已跌破，建議調節" if stop_plan["trailing_broken"] else "✅ 持有中（守住均線之上）"
+            st.metric(f"② 追蹤停利（{TRAILING_STOP_MA_WINDOW}日均線，{status}）",
+                       f"${stop_plan['trailing_ma']:.2f}",
+                       f"跌破時調節 {stop_plan['trailing_sell_pct']:.0%}")
+            st.caption(f"適用於達第一階段目標價後的剩餘部位：只要收盤守住 {TRAILING_STOP_MA_WINDOW}日均線"
+                       "之上就不設停利上限、全程持有；收盤實體跌破才調節部位，不是達標就立刻全數出場。")
+        else:
+            st.info("② 追蹤停利：均線資料不足，暫時無法計算。")
+
+    st.caption("以上為依你提供的持倉規則直接換算的量化結果，屬於規則式計算，不是 AI 生成，"
+               "也不構成投資建議；實際執行仍請自行確認部位身份（新加碼／核心持倉）與基本面狀況。")
+
+
+def render_stock_section(symbol, color, df, stats, trend, patterns, backtest, stop_plan,
+                          quote=None, quote_error=None):
     """單一個股的完整分析區塊：即時報價 → 技術指標圖 → 型態分析 → 訊號回測 → 投資建議與風險評估。"""
     render_realtime_quote(symbol, quote, quote_error)
 
@@ -1404,62 +1523,46 @@ def render_stock_section(symbol, color, df, stats, trend, patterns, backtest, qu
     st.caption("此為根據這段歷史區間回測的結果，反映的是「過去」訊號出現後隔日上漲的機率，"
                "不保證未來會維持相同機率，也不是對下一個交易日的預測。")
 
-    st.markdown("##### 📋 投資建議與風險評估（規則式即時計算，不需呼叫 AI）")
+    st.markdown("##### 📋 快速操作方向（規則式即時計算，不需呼叫 AI）")
     level, level_kind = assess_risk_level(stats)
     action, reasons, _ = build_quick_recommendation(stats)
-    stop_info = suggest_stop_prices(stats["latest_close"], level_kind)
 
-    rc1, rc2 = st.columns([1, 1])
+    rc1, rc2 = st.columns([1, 2])
     with rc1:
         if level_kind == "low":
-            st.success(f"風險等級：{level}")
+            st.success(f"波動風險等級：{level}")
         elif level_kind == "mid":
-            st.warning(f"風險等級：{level}")
+            st.warning(f"波動風險等級：{level}")
         else:
-            st.error(f"風險等級：{level}")
-        st.metric("建議停損價位", f"${stop_info['stop_loss_price']:.2f}",
-                   f"-{stop_info['stop_loss_pct']:.1%}")
-        st.metric("建議停利價位（下緣）", f"${stop_info['take_profit_price_low']:.2f}",
-                   f"+{stop_info['take_profit_pct_low']:.1%}")
-        st.metric("建議停利價位（上緣）", f"${stop_info['take_profit_price_high']:.2f}",
-                   f"+{stop_info['take_profit_pct_high']:.1%}")
+            st.error(f"波動風險等級：{level}")
+        st.caption("依年化波動度與最大回撤估算，僅描述股價波動大小，跟下方停損／停利機制是各自"
+                   "獨立的計算，並非用來決定停損／停利百分比。")
     with rc2:
         st.markdown(f"**快速操作方向：{action}**")
         for r in reasons:
             st.markdown(f"- {r}")
 
-    tp_warning = check_take_profit_vs_resistance(stop_info, trend)
-    if tp_warning:
-        st.warning(tp_warning)
-
-    st.caption(f"以目前收盤價 ${stop_info['entry_ref_price']:.2f} 作為進場參考價，"
-               "依風險等級的一般性百分比原則直接換算成停損／停利股價；"
-               "實際成交價、滑價與手續費會使真實停損／停利價位略有差異，"
-               "本區塊為量化規則計算結果，不構成投資建議。")
+    render_playbook_stop_plan(stop_plan)
 
 
 def build_markdown_report(symbol, stats, start_date, end_date, ai_analysis: str,
-                           trend=None, patterns=None, backtest=None, quote=None) -> str:
+                           trend=None, patterns=None, backtest=None, quote=None, stop_plan=None) -> str:
     trend = trend or {}
     patterns = patterns or []
 
     level, level_kind = assess_risk_level(stats)
     action, reasons, _ = build_quick_recommendation(stats)
-    stop_info = suggest_stop_prices(stats["latest_close"], level_kind)
-    tp_warning = check_take_profit_vs_resistance(stop_info, trend)
+    stop_plan_block = _fmt_stop_plan_lines(stop_plan) if stop_plan else "（本次未提供停損／停利機制資料）"
 
     lines = [
         f"# 股票分析評估報告：{symbol}",
         f"分析區間：{start_date.isoformat()} ~ {end_date.isoformat()}",
         f"歷史技術指標資料更新至：{stats['latest_date'].date().isoformat()}；即時報價：{_fmt_quote(quote)}\n",
         f"## 快速風險評估與操作方向（規則式計算）\n",
-        f"- 風險等級：{level}；快速操作方向：{action}；"
-        f"以進場參考價 ${stop_info['entry_ref_price']:.2f} 換算："
-        f"建議停損價位 ${stop_info['stop_loss_price']:.2f}（-{stop_info['stop_loss_pct']:.1%}）；"
-        f"建議停利價位 ${stop_info['take_profit_price_low']:.2f}～${stop_info['take_profit_price_high']:.2f}"
-        f"（+{stop_info['take_profit_pct_low']:.1%}～+{stop_info['take_profit_pct_high']:.1%}）",
-        (f"\n  - {tp_warning}" if tp_warning else ""),
+        f"- 波動風險等級：{level}；快速操作方向：{action}",
         "".join(f"\n  - {r}" for r in reasons),
+        f"\n\n## 停損／停利機制（依你的持倉規則計算）\n",
+        stop_plan_block,
         f"\n\n## 趨勢與型態\n",
         f"- 趨勢：{trend.get('trend', 'N/A')}；均線排列：{stats['ma_alignment']}；"
         f"布林通道：{stats['bb_position']}；KD：{stats['kd_cross']}（{stats['kd_signal']}）"
@@ -1480,7 +1583,51 @@ def build_markdown_report(symbol, stats, start_date, end_date, ai_analysis: str,
     return "\n".join(lines)
 
 
+def _secret_default(key: str) -> str:
+    """部署到雲端後，若有在 Streamlit 的 Secrets 裡先設定好金鑰，就直接拿來
+    當輸入框的預設值，不用每次重新貼一次；本機測試若沒有設定對應的 secret，
+    則預設空白，維持原本手動輸入的操作方式，兩種情況都還是可以在畫面上
+    手動覆蓋這個預設值。"""
+    try:
+        return st.secrets.get(key, "")
+    except Exception:
+        return ""
+
+
+def check_password() -> bool:
+    """簡單的密碼保護：這支工具會用掉你自己申請的 FMP / Gemini / Alpha Vantage
+    API 額度，部署成公開網址後，如果網址不小心外流，陌生人也能打開來用，
+    會白白消耗你的額度。這裡在 Streamlit 的 Secrets 設定一組 APP_PASSWORD，
+    使用者要先輸入正確密碼才能看到裡面的分析功能。
+
+    本機測試（沒有設定 APP_PASSWORD 這個 secret）時，直接放行不擋密碼，
+    維持原本開發測試的方便性。
+    """
+    try:
+        correct_password = st.secrets["APP_PASSWORD"]
+    except Exception:
+        return True
+
+    if st.session_state.get("password_correct"):
+        return True
+
+    st.set_page_config(page_title="股票分析評估表", layout="centered", page_icon="🔒")
+    st.markdown("### 🔒 這是私人工具，請輸入密碼")
+    pw = st.text_input("密碼", type="password", label_visibility="collapsed",
+                        placeholder="請輸入密碼")
+    if st.button("進入", type="primary"):
+        if pw == correct_password:
+            st.session_state["password_correct"] = True
+            st.rerun()
+        else:
+            st.error("密碼錯誤，請再試一次。")
+    return False
+
+
 def main():
+    if not check_password():
+        return
+
     st.set_page_config(page_title="股票分析評估表", layout="wide", page_icon="📊")
     st.title("📊 股票分析評估表（FMP 股價 + Gemini AI 分析）")
     st.caption("以單一美股個股為分析對象：即時報價、技術指標、型態分析、訊號歷史回測、"
@@ -1488,9 +1635,11 @@ def main():
 
     with st.sidebar:
         st.header("🔑 API 金鑰設定")
-        fmp_key = st.text_input("FMP API 金鑰", type="password",
+        st.caption("已在部署設定裡填好金鑰的話，下面會自動帶出來，不用每次重打；"
+                   "要換一組金鑰時，直接在這裡覆蓋掉就可以。")
+        fmp_key = st.text_input("FMP API 金鑰", type="password", value=_secret_default("FMP_API_KEY"),
                                  help="至 https://site.financialmodelingprep.com/ 註冊取得")
-        gemini_key = st.text_input("Gemini API 金鑰", type="password",
+        gemini_key = st.text_input("Gemini API 金鑰", type="password", value=_secret_default("GEMINI_API_KEY"),
                                     help="至 https://aistudio.google.com/apikey 註冊取得")
         gemini_model = st.text_input("Gemini 模型名稱", value="gemini-3.5-flash-lite",
                                       help="若出現 404 model not found，請至官方文件確認目前可用模型名稱")
@@ -1499,7 +1648,8 @@ def main():
         st.subheader("📰 新聞情緒分析設定（選用）")
         enable_news = st.checkbox("啟用新聞情緒分析（Alpha Vantage + Fear & Greed Index）", value=True)
         alpha_vantage_key = st.text_input(
-            "Alpha Vantage API 金鑰", type="password", disabled=not enable_news,
+            "Alpha Vantage API 金鑰", type="password", value=_secret_default("ALPHA_VANTAGE_API_KEY"),
+            disabled=not enable_news,
             help="至 https://www.alphavantage.co/support/#api-key 免費申請",
         )
         news_limit = st.slider("擷取新聞則數", min_value=10, max_value=200, value=50, step=10,
@@ -1532,11 +1682,17 @@ def main():
         """,
         unsafe_allow_html=True,
     )
-    input_col, _spacer_col = st.columns([1, 2])
+    input_col, target_col, _spacer_col = st.columns([1, 1, 1])
     with input_col:
         symbol = st.text_input(
             "股票代號", value="NVDA", placeholder="輸入股票代號，例如 NVDA",
             label_visibility="collapsed",
+        )
+    with target_col:
+        custom_target_price = st.number_input(
+            "🎯 第一階段停利目標價（選填）", min_value=0.0, value=0.0, step=1.0, format="%.2f",
+            help="對應你的持倉規則裡「階段目標價（如前高 $230~$235）」。留空或填 0，"
+                 "則自動以下方型態分析算出的「近期壓力價」代入。",
         )
     st.caption(f"分析區間會自動抓取最近 {HISTORY_LOOKBACK_DAYS} 天的歷史資料，結束日期以下方"
                "「⚡ 即時報價」實際取得的日期為準（若無法取得即時報價，則以今天的日期為準），"
@@ -1578,6 +1734,7 @@ def main():
     trend = detect_trend_pattern(df)
     patterns = detect_candlestick_patterns(df)
     backtest = backtest_signals(df)
+    stop_plan = compute_playbook_stop_plan(df, trend, custom_target_price=custom_target_price)
 
     date_str = stats["latest_date"].date().isoformat()
     st.info(f"📅 分析區間：{start_date.isoformat()} ~ {end_date.isoformat()}"
@@ -1593,7 +1750,7 @@ def main():
     st.header(f"🔎 {symbol} 個股完整分析")
     st.markdown("##### 📊 績效摘要")
     render_performance_summary(stats)
-    render_stock_section(symbol, STOCK_COLOR, df, stats, trend, patterns, backtest,
+    render_stock_section(symbol, STOCK_COLOR, df, stats, trend, patterns, backtest, stop_plan,
                           quote=quote, quote_error=quote_err)
 
     st.markdown("---")
@@ -1603,7 +1760,8 @@ def main():
     else:
         with st.spinner("正在請 Gemini 進行分析，請稍候..."):
             prompt = build_prompt(symbol, stats, start_date, end_date,
-                                   trend=trend, patterns=patterns, backtest=backtest, quote=quote)
+                                   trend=trend, patterns=patterns, backtest=backtest, quote=quote,
+                                   stop_plan=stop_plan)
             try:
                 analysis = call_gemini(prompt, gemini_key, gemini_model)
             except Exception as exc:
@@ -1611,10 +1769,10 @@ def main():
                 analysis = None
 
         if analysis:
-            st.markdown(style_risk_level_headings(analysis), unsafe_allow_html=True)
+            st.markdown(analysis, unsafe_allow_html=True)
             report_md = build_markdown_report(symbol, stats, start_date, end_date, analysis,
                                                trend=trend, patterns=patterns, backtest=backtest,
-                                               quote=quote)
+                                               quote=quote, stop_plan=stop_plan)
             st.download_button(
                 "📥 下載完整分析報告（Markdown）",
                 data=report_md.encode("utf-8"),
