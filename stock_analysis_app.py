@@ -2064,7 +2064,7 @@ def check_password() -> bool:
 
 def run_us_app():
     """美股模式主流程：單一美股個股的完整技術分析（FMP股價 + Gemini AI）。"""
-    st.title("🇺🇸 美股個股分析（FMP 股價 + Gemini AI 分析）")
+    st.title("📊 個股分析（FMP 股價 + Gemini AI 分析）")
     st.caption("以單一美股個股為分析對象：即時報價、技術指標、型態分析、訊號歷史回測、"
                "規則式風險評估與 Gemini AI 深度分析。")
 
@@ -2779,6 +2779,18 @@ def run_taiwan_app():
         unsafe_allow_html=True,
     )
 
+    with st.expander("🔑 AI 白話解說設定（進階，部署後已設定好金鑰時可略過）", expanded=False):
+        st.caption(
+            "部署到 Streamlit Cloud 並在後台 Secrets 設定好 GEMINI_API_KEY 後，這裡會自動帶入，"
+            "一般使用者完全不用管這個欄位；本機測試、或還沒設定 secrets 時，可以在下面暫時貼上"
+            "金鑰來測試AI白話解說功能（跟美股模式共用同一組 Gemini 金鑰）。"
+        )
+        tw_gemini_key_input = st.text_input(
+            "Gemini API 金鑰（選填）", type="password",
+            value=_secret_default("GEMINI_API_KEY"), key="tw_gemini_key_input",
+            help="至 https://aistudio.google.com/apikey 註冊取得",
+        )
+
     col_a, col_b, col_c = st.columns([1, 2, 1])
     with col_b:
         symbol_input = st.text_input(
@@ -2797,7 +2809,7 @@ def run_taiwan_app():
         st.error("請先輸入股票代號。")
         return
 
-    gemini_key = get_tw_gemini_key()
+    gemini_key = tw_gemini_key_input or get_tw_gemini_key()
 
     with st.spinner("正在抓取股價資料..."):
         try:
