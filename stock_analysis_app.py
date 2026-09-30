@@ -2062,9 +2062,8 @@ def check_password() -> bool:
     return False
 
 
-def run_us_app():
+def run_us_app(shared_gemini_key: str = ""):
     """美股模式主流程：單一美股個股的完整技術分析（FMP股價 + Gemini AI）。"""
-    st.title("📊 個股分析（FMP 股價 + Gemini AI 分析）")
     st.caption("以單一美股個股為分析對象：即時報價、技術指標、型態分析、訊號歷史回測、"
                "規則式風險評估與 Gemini AI 深度分析。")
 
@@ -2074,8 +2073,8 @@ def run_us_app():
                    "要換一組金鑰時，直接在這裡覆蓋掉就可以。")
         fmp_key = st.text_input("FMP API 金鑰", type="password", value=_secret_default("FMP_API_KEY"),
                                  help="至 https://site.financialmodelingprep.com/ 註冊取得")
-        gemini_key = st.text_input("Gemini API 金鑰", type="password", value=_secret_default("GEMINI_API_KEY"),
-                                    help="至 https://aistudio.google.com/apikey 註冊取得")
+        gemini_key = shared_gemini_key
+        st.caption("Gemini API 金鑰已統一在首頁上方輸入，美股、台股分析共用同一組金鑰，這裡不用再輸入一次。")
         gemini_model = st.text_input("Gemini 模型名稱", value="gemini-3.5-flash-lite",
                                       help="若出現 404 model not found，請至官方文件確認目前可用模型名稱")
 
@@ -2759,7 +2758,7 @@ def get_tw_gemini_key() -> str:
         return ""
 
 
-def run_taiwan_app():
+def run_taiwan_app(shared_gemini_key: str = ""):
     """台股模式主流程：給完全新手用，輸入代號按一下就能看到型態分析＋白話AI解說。"""
     st.markdown(
         """
@@ -2779,18 +2778,6 @@ def run_taiwan_app():
         unsafe_allow_html=True,
     )
 
-    with st.expander("🔑 AI 白話解說設定（進階，部署後已設定好金鑰時可略過）", expanded=False):
-        st.caption(
-            "部署到 Streamlit Cloud 並在後台 Secrets 設定好 GEMINI_API_KEY 後，這裡會自動帶入，"
-            "一般使用者完全不用管這個欄位；本機測試、或還沒設定 secrets 時，可以在下面暫時貼上"
-            "金鑰來測試AI白話解說功能（跟美股模式共用同一組 Gemini 金鑰）。"
-        )
-        tw_gemini_key_input = st.text_input(
-            "Gemini API 金鑰（選填）", type="password",
-            value=_secret_default("GEMINI_API_KEY"), key="tw_gemini_key_input",
-            help="至 https://aistudio.google.com/apikey 註冊取得",
-        )
-
     col_a, col_b, col_c = st.columns([1, 2, 1])
     with col_b:
         symbol_input = st.text_input(
@@ -2809,7 +2796,7 @@ def run_taiwan_app():
         st.error("請先輸入股票代號。")
         return
 
-    gemini_key = tw_gemini_key_input or get_tw_gemini_key()
+    gemini_key = shared_gemini_key or get_tw_gemini_key()
 
     with st.spinner("正在抓取股價資料..."):
         try:
@@ -2958,18 +2945,60 @@ def main():
         unsafe_allow_html=True,
     )
 
-    market = st.radio(
-        "請選擇要分析的市場",
-        ["🇺🇸 美股（進階：技術指標＋停損停利＋持倉風控）", "🇹🇼 台股（新手：型態分析＋白話AI解說）"],
-        horizontal=True,
-        key="market_selector",
+    st.markdown("##### 🔑 Gemini AI 金鑰")
+    shared_gemini_key = st.text_input(
+        "Gemini API 金鑰（美股、台股分析共用；已在後台設定好的話會自動帶入，也可以直接在這裡輸入）",
+        type="password",
+        value=_secret_default("GEMINI_API_KEY"),
+        key="shared_gemini_key_input",
+        help="至 https://aistudio.google.com/apikey 免費註冊取得",
     )
+    st.caption("金鑰僅保存於本次瀏覽器 session 記憶體中，不會寫入檔案或上傳。輸入好金鑰後，"
+               "下方選擇市場、輸入股票代號即可直接得到 AI 分析結果。")
+
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stButton"] button {
+            font-size: 1.25rem;
+            font-weight: 700;
+            padding: 0.9rem 0.6rem;
+            border-radius: 12px;
+            height: auto;
+            white-space: normal;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("**請選擇要分析的市場**")
+    if "market_selector" not in st.session_state:
+        st.session_state["market_selector"] = "us"
+
+    mcol1, mcol2 = st.columns(2)
+    with mcol1:
+        if st.button(
+            "🇺🇸 美股\n（進階：技術指標＋停損停利＋持倉風控）",
+            key="market_btn_us",
+            type="primary" if st.session_state["market_selector"] == "us" else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state["market_selector"] = "us"
+    with mcol2:
+        if st.button(
+            "🇹🇼 台股\n（新手：型態分析＋白話AI解說）",
+            key="market_btn_tw",
+            type="primary" if st.session_state["market_selector"] == "tw" else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state["market_selector"] = "tw"
+
     st.markdown("---")
 
-    if market.startswith("🇺🇸"):
-        run_us_app()
+    if st.session_state["market_selector"] == "us":
+        run_us_app(shared_gemini_key=shared_gemini_key)
     else:
-        run_taiwan_app()
+        run_taiwan_app(shared_gemini_key=shared_gemini_key)
 
 
 if __name__ == "__main__":
