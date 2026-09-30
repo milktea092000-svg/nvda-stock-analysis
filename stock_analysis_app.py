@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-股票分析評估表 (FMP 股價資料 + Gemini AI 分析)
+股票分析評估表 (美股：FMP 股價資料 + Gemini AI 分析／台股：yfinance + Gemini 白話解說)
 =================================================
 
-以「單一美股個股」為分析對象（輸入一個股票代號即可分析）：
+首頁可以選擇要分析「美股」還是「台股」，兩種市場各自獨立運作，共用同一組
+Gemini API 金鑰（美股另外還需要 FMP／可選 Alpha Vantage 金鑰）：
+
+【美股模式】以「單一美股個股」為分析對象（輸入一個股票代號即可分析）：
     1. 向 Financial Modeling Prep (FMP) 取得該股票的歷史股價資料
     2. 即時報價：另外呼叫 FMP 的即時報價 API，顯示目前價格、漲跌、今日區間、成交量與更新時間，
        讓你看到的「現在」價格跟技術指標所依據的「歷史收盤」資料能互相對照
@@ -46,6 +49,14 @@ API 金鑰只會保存在你本機瀏覽器開啟的這個 session 記憶體中�
 漲跌的預言；本工具的「訊號回測」就是要讓你看到這些訊號過去實際的命中率（通常落在五、
 六成左右），藉此管理預期，而不是把任何單一訊號當成保證獲利的買賣依據。所有內容（含 AI
 分析）僅供參考，不構成投資建議。
+
+【台股模式】給完全新手用，設計理念不同於美股模式：不需要使用者自己申請/輸入任何
+API 金鑰（Gemini 金鑰由部署者透過 st.secrets 事先設定好）、不顯示 RSI/MACD/KD 等
+進階技術指標（避免畫面太複雜嚇跑新手），改用 K線＋均線＋成交量＋支撐壓力＋K線型態
+辨識＋與大盤（加權指數）的相對強弱比較，並把結果濃縮成一句「偏多／中性／偏空」的
+綜合燈號，再交給 Gemini 用生活化白話文解釋給完全不懂技術分析的人聽。股價資料來源
+是 Yahoo Finance（透過 yfinance 套件，不需要申請帳號或金鑰），台股代號會自動嘗試
+補上 .TW（上市）／.TWO（上櫃）。
 """
 
 import json
@@ -55,6 +66,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import yfinance as yf
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 
@@ -2050,12 +2062,9 @@ def check_password() -> bool:
     return False
 
 
-def main():
-    if not check_password():
-        return
-
-    st.set_page_config(page_title="股票分析評估表", layout="wide", page_icon="📊")
-    st.title("📊 股票分析評估表（FMP 股價 + Gemini AI 分析）")
+def run_us_app():
+    """美股模式主流程：單一美股個股的完整技術分析（FMP股價 + Gemini AI）。"""
+    st.title("🇺🇸 美股個股分析（FMP 股價 + Gemini AI 分析）")
     st.caption("以單一美股個股為分析對象：即時報價、技術指標、型態分析、訊號歷史回測、"
                "規則式風險評估與 Gemini AI 深度分析。")
 
@@ -2378,6 +2387,577 @@ def main():
 
         st.caption("📢 免責聲明：新聞情緒分析與 Fear & Greed Index 僅反映歷史新聞與市場情緒統計，"
                    "不構成投資建議或未來走勢預測，請自行判斷並承擔投資風險。")
+
+
+# ----------------------------------------------------------------------------
+# 6. 台股模式（Yahoo Finance／yfinance，給完全新手用，不需自己申請金鑰）
+#    以下函式搬自 taiwan_stock_pattern_app.py，僅重新命名 main()→run_taiwan_app()，
+#    並移除其中重複的 st.set_page_config()（改由最外層共用的 main() 統一呼叫一次）。
+#    detect_trend_pattern／detect_candlestick_patterns／_fmt_patterns／_fmt_num／
+#    call_gemini／STOCK_COLOR／GEMINI_URL_TMPL 皆與美股模式共用同一份，不重複定義。
+# ----------------------------------------------------------------------------
+
+def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """yfinance 在某些版本／某些查詢方式下，會回傳多層欄位（MultiIndex），
+    這裡統一攤平成單層，避免後面存取 df['Close'] 時出錯。"""
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+def fetch_tw_history(symbol_input: str, lookback_days: int = 365):
+    """抓取台股歷史日線資料（open/high/low/close/volume）。
+
+    使用者只要輸入數字代號（例如 2330），這裡會自動依序嘗試：
+        1. 使用者輸入的原始字串（若已經自己打了 .TW / .TWO 等後綴）
+        2. 補上 .TW（上市股票，例如 2330.TW = 台積電）
+        3. 補上 .TWO（上櫃股票）
+    第一個抓得到資料的就採用，讓完全不懂上市/上櫃差異的人也能直接用。
+
+    回傳 (df, 實際採用的代號)；抓不到資料時丟出例外，訊息用中文說明。
+    """
+    raw = symbol_input.strip().upper()
+    if not raw:
+        raise ValueError("請輸入股票代號。")
+
+    candidates = [raw] if "." in raw else [f"{raw}.TW", f"{raw}.TWO"]
+
+    end = datetime.now()
+    start = end - timedelta(days=lookback_days)
+
+    last_err = None
+    for candidate in candidates:
+        try:
+            df = yf.download(
+                candidate,
+                start=start.strftime("%Y-%m-%d"),
+                end=(end + timedelta(days=1)).strftime("%Y-%m-%d"),
+                auto_adjust=False,
+                progress=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - 對外都轉成中文訊息
+            last_err = exc
+            continue
+
+        if df is None or df.empty:
+            continue
+
+        df = _flatten_yf_columns(df)
+        df = df.rename(columns={
+            "Open": "open", "High": "high", "Low": "low",
+            "Close": "close", "Volume": "volume",
+        })
+        keep_cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+        df = df[keep_cols].dropna(subset=["close"])
+        df = df.reset_index().rename(columns={"Date": "date"})
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+
+        if len(df) >= 30:
+            return df, candidate
+
+    raise ValueError(
+        f"查不到股票代號「{raw}」的資料。已經自動嘗試過"
+        f"{'、'.join(candidates)}，請確認代號是否正確"
+        "（台股代號通常是4位數字，例如台積電是2330）。"
+        + (f" 詳細錯誤：{last_err}" if last_err else "")
+    )
+
+
+def fetch_tw_realtime_quote(resolved_symbol: str):
+    """嘗試取得目前即時（或最近）報價；失敗時回傳 None，不中斷整體分析。"""
+    try:
+        ticker = yf.Ticker(resolved_symbol)
+        fast_info = getattr(ticker, "fast_info", None)
+        if not fast_info:
+            return None
+        price = fast_info.get("last_price")
+        prev_close = fast_info.get("previous_close")
+        day_low = fast_info.get("day_low")
+        day_high = fast_info.get("day_high")
+        volume = fast_info.get("last_volume")
+        if price is None:
+            return None
+        change = (price - prev_close) if prev_close else None
+        change_pct = (change / prev_close * 100) if (change is not None and prev_close) else None
+        return {
+            "price": price, "previous_close": prev_close,
+            "change": change, "change_pct": change_pct,
+            "day_low": day_low, "day_high": day_high, "volume": volume,
+        }
+    except Exception:
+        return None
+
+
+def fetch_index_history(lookback_days: int = 365):
+    """抓取台股加權指數（^TWII，也就是新聞常講的「大盤」）歷史資料，
+    用來跟個股做「相對強弱」比較。抓不到時回傳 None，不影響其他分析。"""
+    try:
+        end = datetime.now()
+        start = end - timedelta(days=lookback_days)
+        df = yf.download(
+            "^TWII",
+            start=start.strftime("%Y-%m-%d"),
+            end=(end + timedelta(days=1)).strftime("%Y-%m-%d"),
+            auto_adjust=False,
+            progress=False,
+        )
+        if df is None or df.empty:
+            return None
+        df = _flatten_yf_columns(df)
+        df = df.rename(columns={"Close": "close"})
+        df = df.reset_index().rename(columns={"Date": "date"})
+        df["date"] = pd.to_datetime(df["date"])
+        return df[["date", "close"]].dropna().sort_values("date").reset_index(drop=True)
+    except Exception:
+        return None
+
+
+def get_tw_company_info(resolved_symbol: str) -> dict:
+    """嘗試取得公司基本資料（產業別、本益比、殖利率、市值），讓新手對這家
+    公司「在幹嘛」有基本概念，不只是看線圖。yfinance的公司資料有時抓不到
+    或抓得比較慢，失敗時回傳空 dict，不影響其他分析結果。"""
+    try:
+        ticker = yf.Ticker(resolved_symbol)
+        info = ticker.get_info() if hasattr(ticker, "get_info") else ticker.info
+        if not info:
+            return {}
+        dividend_yield = info.get("dividendYield")
+        if dividend_yield is not None and dividend_yield < 1:
+            dividend_yield *= 100  # 有些版本回傳的是小數（0.02），統一換成百分比
+        return {
+            "name": info.get("longName") or info.get("shortName"),
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
+            "pe": info.get("trailingPE"),
+            "dividend_yield": dividend_yield,
+            "market_cap": info.get("marketCap"),
+        }
+    except Exception:
+        return {}
+
+
+def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["ma5"] = df["close"].rolling(5, min_periods=1).mean()
+    df["ma20"] = df["close"].rolling(20, min_periods=1).mean()
+    df["ma60"] = df["close"].rolling(60, min_periods=1).mean()
+    return df
+
+
+def compute_52week_stats(df: pd.DataFrame, latest_close: float) -> dict:
+    """用抓到的歷史資料（最長約一年）估算52週高低點，以及目前價位落在
+    這段區間的百分比位置（0%＝貼近最低點，100%＝貼近最高點）。"""
+    high_52w = df["high"].max()
+    low_52w = df["low"].min()
+    rng = (high_52w - low_52w) if high_52w != low_52w else 1e-9
+    position_pct = (latest_close - low_52w) / rng * 100
+    return {"high": high_52w, "low": low_52w, "position_pct": position_pct}
+
+
+def compute_relative_strength(df: pd.DataFrame, index_df, window: int = 60) -> dict:
+    """比較個股與大盤（加權指數）在近 window 個交易日的漲跌幅，
+    判斷這支股票最近是比大盤強還是比大盤弱。任一邊資料不足時回傳 None，
+    不影響其他分析。"""
+    if index_df is None or len(df) < 2:
+        return None
+
+    stock_recent = df.tail(min(window, len(df)))
+    if stock_recent["close"].iloc[0] == 0:
+        return None
+    stock_return = (stock_recent["close"].iloc[-1] / stock_recent["close"].iloc[0] - 1) * 100
+
+    idx_recent = index_df.tail(min(window, len(index_df)))
+    if len(idx_recent) < 2 or idx_recent["close"].iloc[0] == 0:
+        return None
+    index_return = (idx_recent["close"].iloc[-1] / idx_recent["close"].iloc[0] - 1) * 100
+
+    return {
+        "days": len(stock_recent),
+        "stock_return": stock_return,
+        "index_return": index_return,
+        "diff": stock_return - index_return,
+    }
+
+
+def compute_outlook(trend: dict, patterns: list, relative_strength) -> dict:
+    """把趨勢方向、突破/跌破、K線型態、與大盤的相對強弱，綜合整理成一個
+    給新手看的「偏多／中性／偏空」燈號，方便一眼掌握大方向，細節再往下看
+    各項分析。這只是把上面已經算出的訊號做簡單加總，不是額外的獨立指標，
+    也不構成投資建議。"""
+    score = 0.0
+    if trend.get("trend") == "上升趨勢":
+        score += 1
+    elif trend.get("trend") == "下降趨勢":
+        score -= 1
+
+    breakout = trend.get("breakout") or ""
+    if "向上突破" in breakout:
+        score += 1
+    elif "向下跌破" in breakout:
+        score -= 1
+
+    for _, name, _ in patterns:
+        if "看漲" in name or "鎚子線" in name:
+            score += 0.5
+        elif "看跌" in name or "吊人線" in name:
+            score -= 0.5
+
+    if relative_strength is not None:
+        if relative_strength["diff"] > 1:
+            score += 0.5
+        elif relative_strength["diff"] < -1:
+            score -= 0.5
+
+    # 台股慣例：紅色代表漲／偏多，綠色代表跌／偏空，跟K線圖顏色保持一致。
+    if score >= 1.5:
+        return {"label": "偏多", "emoji": "🔴", "color": "#dc2626",
+                "detail": "多項訊號偏向多方，但這只是歷史資料的統計整理，僅供學習參考，不是投資建議。"}
+    if score <= -1.5:
+        return {"label": "偏空", "emoji": "🟢", "color": "#16a34a",
+                "detail": "多項訊號偏向空方，但這只是歷史資料的統計整理，僅供學習參考，不是投資建議。"}
+    return {"label": "中性 ／ 觀望", "emoji": "⚪", "color": "#6b7280",
+            "detail": "目前多空訊號不明顯，屬於觀望階段，可以持續留意後續變化。"}
+
+
+def chart_tw_pattern(df: pd.DataFrame, symbol: str, trend: dict):
+    """台股K線圖：紅漲綠跌（台股慣例，與美股模式的技術指標圖顏色邏輯相反，
+    因此獨立成自己的繪圖函式，不與美股模式的 chart_technical() 共用）。"""
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.72, 0.28], vertical_spacing=0.04,
+    )
+
+    fig.add_trace(go.Candlestick(
+        x=df["date"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+        name="K線",
+        increasing=dict(line=dict(color="#dc2626")),
+        decreasing=dict(line=dict(color="#16a34a")),
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["ma5"], name="MA5",
+                              line=dict(color="#eab308", width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["ma20"], name="MA20",
+                              line=dict(color="#0ea5e9", width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["ma60"], name="MA60",
+                              line=dict(color="#7c3aed", width=1.2)), row=1, col=1)
+
+    if trend.get("resistance") is not None and not pd.isna(trend["resistance"]):
+        fig.add_hline(y=trend["resistance"], line_dash="dot", line_color="#dc2626",
+                       annotation_text=f"近期壓力 {trend['resistance']:.2f}", row=1, col=1)
+    if trend.get("support") is not None and not pd.isna(trend["support"]):
+        fig.add_hline(y=trend["support"], line_dash="dot", line_color="#16a34a",
+                       annotation_text=f"近期支撐 {trend['support']:.2f}", row=1, col=1)
+
+    if "volume" in df.columns:
+        vol_colors = ["#dc2626" if c >= o else "#16a34a"
+                      for o, c in zip(df["open"], df["close"])]
+        fig.add_trace(go.Bar(
+            x=df["date"], y=df["volume"], name="成交量",
+            marker_color=vol_colors, showlegend=False,
+        ), row=2, col=1)
+
+    fig.update_xaxes(rangeslider_visible=False, row=1, col=1)
+    fig.update_xaxes(rangeslider_visible=False, row=2, col=1)
+    fig.update_yaxes(title_text="價格（新台幣）", row=1, col=1)
+    fig.update_yaxes(title_text="成交量", row=2, col=1)
+    fig.update_layout(
+        title=f"{symbol}：K線、均線、成交量與支撐壓力",
+        template="plotly_white", height=680, showlegend=True,
+        margin=dict(l=40, r=20, t=60, b=40),
+    )
+    return fig
+
+
+def build_tw_beginner_prompt(symbol: str, resolved_symbol: str, latest_close: float,
+                              latest_date: str, trend: dict, patterns: list, quote=None,
+                              stats52=None, relative_strength=None, company_info=None) -> str:
+    quote_text = "（本次未取得即時報價，以下以最新收盤價為準）"
+    if quote and quote.get("price") is not None:
+        chg = quote.get("change")
+        chg_pct = quote.get("change_pct")
+        chg_text = f"，較前一交易日{'上漲' if (chg or 0) >= 0 else '下跌'} {abs(chg):.2f} 元（{abs(chg_pct):.2f}%）" \
+            if chg is not None and chg_pct is not None else ""
+        quote_text = f"目前價格 {quote['price']:.2f} 元{chg_text}"
+
+    extra_lines = []
+    if stats52:
+        extra_lines.append(
+            f"- 近一年（約52週）最高 {stats52['high']:.2f} 元／最低 {stats52['low']:.2f} 元，"
+            f"目前價位落在這段區間的 {stats52['position_pct']:.0f}% 位置"
+            "（0%接近最低點，100%接近最高點）"
+        )
+    if relative_strength:
+        extra_lines.append(
+            f"- 近{relative_strength['days']}個交易日：這支股票漲跌 {relative_strength['stock_return']:+.1f}%，"
+            f"同期大盤（加權指數）漲跌 {relative_strength['index_return']:+.1f}%，"
+            f"相對大盤{'強勢' if relative_strength['diff'] > 0 else '弱勢' if relative_strength['diff'] < 0 else '持平'}"
+        )
+    if company_info and (company_info.get("industry") or company_info.get("sector")):
+        info_bits = []
+        if company_info.get("industry"):
+            info_bits.append(f"產業別：{company_info['industry']}")
+        if company_info.get("pe"):
+            info_bits.append(f"本益比：{company_info['pe']:.1f}")
+        if company_info.get("dividend_yield"):
+            info_bits.append(f"殖利率：{company_info['dividend_yield']:.1f}%")
+        if info_bits:
+            extra_lines.append(f"- 公司基本資料：{'／'.join(info_bits)}")
+    extra_block = ("\n".join(extra_lines) + "\n") if extra_lines else ""
+
+    data_block = f"""
+【{symbol}（實際查詢代號：{resolved_symbol}）資料，更新至 {latest_date}】
+- {quote_text}
+- 最新收盤價：{latest_close:.2f} 元
+- 近期趨勢：{trend.get('trend', 'N/A')}
+- 近期支撐價：{trend.get('support'):.2f} 元／近期壓力價：{trend.get('resistance'):.2f} 元
+- 是否剛突破或跌破：{trend.get('breakout') or '沒有'}
+- 最近5天K線型態：{_fmt_patterns(patterns)}
+{extra_block}"""
+
+    prompt = f"""你是一位很會教學、有耐心的股市入門老師，現在要跟一位「完全沒學過技術分析」的
+初學者解釋這支股票最近的走勢型態。這位讀者不知道什麼是支撐、壓力、K線型態，請你完全
+用生活化的白話文解釋，禁止只丟術語不解釋。
+
+{data_block}
+
+請用繁體中文，依照以下架構回答（使用 Markdown 標題，勿使用表格，語氣像在跟朋友聊天
+但保持專業正確，不要浮誇）：
+
+## 1. 現在股價在做什麼（白話說明）
+用一般人聽得懂的方式，解釋目前是漲勢、跌勢還是盤整，並簡單解釋「支撐」跟「壓力」
+分別是什麼意思（例如：支撐可以想像成地板，壓力可以想像成天花板），再套用到這支股票
+目前的實際價位上。
+
+## 2. 最近K線型態代表什麼
+如果上面有偵測到K線型態，請用白話解釋這個型態通常代表市場心理上發生了什麼事
+（例如十字星代表多空雙方勢均力敵，猶豫不決）；如果沒有偵測到型態，就直接說明
+「這幾天沒有出現特別值得注意的型態，屬於正常情況」，不要硬掰一個出來。
+
+## 3. 新手可以怎麼解讀（僅供學習參考）
+用「如果...歷史上這類情況通常...」的方式舉例說明，避免使用「建議買進/賣出」這類
+明確操作指令。務必提醒：這只是根據過去股價統計出的型態參考，不是對未來漲跌的保證，
+也不構成投資建議。
+
+## 4. 給新手的小提醒
+用1-2句話提醒新手技術分析的限制（例如：型態分析是「落後」於已發生的價格，看到型態
+時價格可能已經反應一部分了），並鼓勵他如果想認真投資，除了型態，也要多了解基本面
+與風險控管，不要只看單一圖表就做決定。
+
+請全程使用簡單易懂的白話文，避免使用讀者可能看不懂的專有名詞；若必須使用專有名詞
+（例如支撐、壓力、突破），第一次出現時務必附上白話解釋。全文控制在500字以內。
+"""
+    return prompt
+
+
+def get_tw_gemini_key() -> str:
+    """台股模式優先從 Streamlit 的 st.secrets 讀取（部署時由管理者設定，使用者看不到、
+    也不用輸入）；本機測試若沒有設定 secrets，才退回讓開發者自己在旁邊輸入。"""
+    try:
+        return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        return ""
+
+
+def run_taiwan_app():
+    """台股模式主流程：給完全新手用，輸入代號按一下就能看到型態分析＋白話AI解說。"""
+    st.markdown(
+        """
+        <div style="text-align:center; padding: 12px 0 4px 0;">
+            <h1 style="margin-bottom:4px;">📈 台股型態分析小幫手</h1>
+            <p style="color:#6b7280; font-size:1.05rem;">
+                輸入股票代號，馬上看懂最近的走勢型態（附白話解說，新手也看得懂）
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    date_placeholder = st.empty()
+    date_placeholder.markdown(
+        "<p style='text-align:center; color:#9ca3af; font-size:0.9rem;'>"
+        "尚未查詢，輸入股票代號後即可看到資料日期</p>",
+        unsafe_allow_html=True,
+    )
+
+    col_a, col_b, col_c = st.columns([1, 2, 1])
+    with col_b:
+        symbol_input = st.text_input(
+            "請輸入台股代號",
+            placeholder="例如：2330（台積電）、2317（鴻海）、0050（元大台灣50）",
+            label_visibility="visible",
+            key="tw_symbol_input",
+        )
+        run = st.button("🔍 開始分析", type="primary", use_container_width=True, key="tw_run_button")
+
+    if not run:
+        st.info("💡 輸入股票代號後按下「開始分析」即可，不需要輸入任何密碼或帳號。")
+        return
+
+    if not symbol_input.strip():
+        st.error("請先輸入股票代號。")
+        return
+
+    gemini_key = get_tw_gemini_key()
+
+    with st.spinner("正在抓取股價資料..."):
+        try:
+            df_raw, resolved_symbol = fetch_tw_history(symbol_input)
+        except Exception as exc:
+            st.error(str(exc))
+            return
+
+    df = add_moving_averages(df_raw)
+    trend = detect_trend_pattern(df)
+    patterns = detect_candlestick_patterns(df)
+    quote = fetch_tw_realtime_quote(resolved_symbol)
+
+    latest_close = float(df["close"].iloc[-1])
+    latest_date = df["date"].iloc[-1].date().isoformat()
+
+    stats52 = compute_52week_stats(df, latest_close)
+    company_info = get_tw_company_info(resolved_symbol)
+    with st.spinner("正在比對大盤資料..."):
+        index_df = fetch_index_history()
+    relative_strength = compute_relative_strength(df, index_df)
+    outlook = compute_outlook(trend, patterns, relative_strength)
+
+    today_str = datetime.now().date().isoformat()
+    if latest_date == today_str:
+        date_note = "✅ 含今日最新收盤資料"
+    else:
+        date_note = "⚠️ 非今日資料（可能是假日、尚未收盤，或資料來源更新延遲）"
+    date_placeholder.markdown(
+        f"<p style='text-align:center; color:#374151; font-size:0.95rem;'>"
+        f"📅 資料日期：<b>{latest_date}</b>　{date_note}</p>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+
+    if quote and quote.get("price") is not None:
+        qc1, qc2, qc3, qc4 = st.columns(4)
+        qc1.metric("目前價格", f"{quote['price']:.2f}",
+                    f"{quote['change']:+.2f} ({quote['change_pct']:+.2f}%)" if quote.get("change") is not None else None)
+        qc2.metric("今日區間", f"{_fmt_num(quote.get('day_low'))} ~ {_fmt_num(quote.get('day_high'))}")
+        qc3.metric("成交量", _fmt_num(quote.get("volume"), 0))
+        qc4.metric("資料代號", resolved_symbol)
+    else:
+        st.caption(f"（本次未取得即時報價，以下技術分析以最新收盤價 {latest_close:.2f} 為準，"
+                   f"資料代號：{resolved_symbol}）")
+
+    st.markdown(
+        f"""
+        <div style="border:1px solid {outlook['color']}; border-radius:10px;
+                    padding:14px 18px; margin:10px 0; background:{outlook['color']}0d;">
+            <span style="font-size:1.3rem; font-weight:700; color:{outlook['color']};">
+                {outlook['emoji']} 綜合研判：{outlook['label']}
+            </span>
+            <p style="margin:6px 0 0 0; color:#4b5563; font-size:0.9rem;">{outlook['detail']}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if company_info and (company_info.get("industry") or company_info.get("sector") or company_info.get("pe")):
+        st.markdown("##### 🏢 公司基本資料")
+        ic1, ic2, ic3, ic4 = st.columns(4)
+        ic1.metric("產業別", company_info.get("industry") or company_info.get("sector") or "N/A")
+        ic2.metric("本益比（PE）", f"{company_info['pe']:.1f}" if company_info.get("pe") else "N/A")
+        ic3.metric("殖利率", f"{company_info['dividend_yield']:.1f}%" if company_info.get("dividend_yield") else "N/A")
+        ic4.metric("市值（億元）", f"{company_info['market_cap'] / 1e8:,.0f}" if company_info.get("market_cap") else "N/A")
+        st.caption("本益比、殖利率、市值僅供參考，資料可能有延遲或缺漏，正式投資決策請以官方公開資訊為準。")
+
+    st.plotly_chart(chart_tw_pattern(df, symbol_input.strip().upper(), trend), use_container_width=True)
+
+    st.markdown("##### 🔍 型態分析結果")
+    tc1, tc2 = st.columns(2)
+    with tc1:
+        st.metric("趨勢方向", trend["trend"])
+        st.metric("支撐 ／ 壓力", f"{_fmt_num(trend['support'])} ／ {_fmt_num(trend['resistance'])}")
+        if trend["breakout"]:
+            st.warning(trend["breakout"])
+        st.metric("近一年（52週）高／低", f"{_fmt_num(stats52['high'])} ／ {_fmt_num(stats52['low'])}")
+        st.caption(f"目前價位落在近一年區間的 {stats52['position_pct']:.0f}% 位置"
+                   "（0%接近最低點，100%接近最高點）")
+    with tc2:
+        st.markdown("**最近5天K線型態**")
+        if patterns:
+            for d, name, meaning in patterns:
+                st.markdown(f"- **{d}｜{name}**：{meaning}")
+        else:
+            st.caption("已檢查最近5天的K線，但沒有出現十字星/鎚子線/吞噬型態等明顯型態，這是正常情況。")
+
+    if relative_strength:
+        diff = relative_strength["diff"]
+        verdict = "比大盤強勢" if diff > 1 else "比大盤弱勢" if diff < -1 else "跟大盤差不多"
+        st.markdown("##### ⚖️ 與大盤比較")
+        rc1, rc2, rc3 = st.columns(3)
+        rc1.metric(f"近{relative_strength['days']}個交易日漲跌", f"{relative_strength['stock_return']:+.1f}%")
+        rc2.metric("同期大盤（加權指數）漲跌", f"{relative_strength['index_return']:+.1f}%")
+        rc3.metric("相對表現", verdict, f"{diff:+.1f}%")
+        st.caption("「相對表現」是這支股票漲跌幅減掉大盤漲跌幅，數字越大代表比大盤強勢。")
+
+    st.markdown("---")
+    st.markdown("##### 🤖 AI 白話解說")
+
+    if not gemini_key:
+        st.info(
+            "目前這個網站還沒有設定AI解說功能（需要管理者在後台設定金鑰），"
+            "但上面的型態分析結果已經可以直接看囉！"
+        )
+    else:
+        with st.spinner("AI 正在整理白話解說，請稍候..."):
+            try:
+                prompt = build_tw_beginner_prompt(
+                    symbol_input.strip().upper(), resolved_symbol, latest_close,
+                    latest_date, trend, patterns, quote=quote,
+                    stats52=stats52, relative_strength=relative_strength,
+                    company_info=company_info,
+                )
+                explanation = call_gemini(prompt, gemini_key)
+                st.markdown(explanation)
+            except Exception as exc:
+                st.warning(f"AI解說暫時無法產生：{exc}\n\n（不影響上面的型態分析結果）")
+
+    st.markdown("---")
+    st.caption(
+        "📢 免責聲明：本工具僅根據歷史股價資料做規則式型態辨識與AI文字整理，"
+        "屬於學習與教育用途，不構成投資建議，也不保證未來走勢；股票交易有風險，"
+        "投資前應自行判斷或諮詢專業意見。"
+    )
+
+
+# ----------------------------------------------------------------------------
+# 7. 共用主入口：先驗證密碼，再讓使用者選擇市場（美股／台股），兩種模式互相獨立
+# ----------------------------------------------------------------------------
+
+def main():
+    if not check_password():
+        return
+
+    st.set_page_config(page_title="股票分析評估表", layout="wide", page_icon="📊")
+    st.markdown(
+        """
+        <div style="text-align:center; padding: 4px 0 8px 0;">
+            <h1 style="margin-bottom:4px;">📊 股票分析評估表</h1>
+            <p style="color:#6b7280;">美股：技術指標＋Gemini AI＋持倉風控｜台股：型態分析＋白話AI解說</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    market = st.radio(
+        "請選擇要分析的市場",
+        ["🇺🇸 美股（進階：技術指標＋停損停利＋持倉風控）", "🇹🇼 台股（新手：型態分析＋白話AI解說）"],
+        horizontal=True,
+        key="market_selector",
+    )
+    st.markdown("---")
+
+    if market.startswith("🇺🇸"):
+        run_us_app()
+    else:
+        run_taiwan_app()
 
 
 if __name__ == "__main__":
