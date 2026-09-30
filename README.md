@@ -1,2 +1,2 @@
 # nvda-stock-analysis
-美股分析小幫手
+個股分析小幫手
