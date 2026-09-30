@@ -1198,7 +1198,7 @@ def detect_trend_pattern(df: pd.DataFrame, short_win: int = 20, breakout_win: in
 # 3. 視覺化圖表
 # ----------------------------------------------------------------------------
 
-def chart_technical(df, symbol, color):
+def chart_technical(df, symbol, color, trend=None):
     # 這張圖用 make_subplots 把5個子圖（價格/OBV/KD/RSI/MACD）疊在同一張圖裡，
     # 但 Plotly 的圖例（legend）是「整張圖共用一份」，不會照子圖分開，所以底下
     # 每一條線都刻意指定成「整張圖裡獨一無二」的顏色，即使兩條線位於不同子圖、
@@ -1231,6 +1231,13 @@ def chart_technical(df, symbol, color):
                               line=dict(color="#0ea5e9", width=1.2)), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=df["date"], y=df["ma60"], name="MA60",
                               line=dict(color="#7c3aed", width=1.2)), row=1, col=1, secondary_y=False)
+    if trend:
+        if trend.get("resistance") is not None and not pd.isna(trend["resistance"]):
+            fig.add_hline(y=trend["resistance"], line_dash="dot", line_color="#dc2626",
+                           annotation_text=f"近期壓力 {trend['resistance']:.2f}", row=1, col=1)
+        if trend.get("support") is not None and not pd.isna(trend["support"]):
+            fig.add_hline(y=trend["support"], line_dash="dot", line_color="#16a34a",
+                           annotation_text=f"近期支撐 {trend['support']:.2f}", row=1, col=1)
     fig.add_trace(go.Bar(x=df["date"], y=df["volume"], name="成交量",
                           marker=dict(color="rgba(150,150,150,0.35)")), row=1, col=1, secondary_y=True)
 
@@ -1921,7 +1928,7 @@ def render_stock_section(symbol, color, df, stats, trend, patterns, backtest, st
     """單一個股的完整分析區塊：即時報價 → 技術指標圖 → 型態分析 → 訊號回測 → 投資建議與風險評估。"""
     render_realtime_quote(symbol, quote, quote_error)
 
-    st.plotly_chart(chart_technical(df, symbol, color), use_container_width=True)
+    st.plotly_chart(chart_technical(df, symbol, color, trend=trend), use_container_width=True)
 
     st.markdown("##### 🔍 型態分析")
     tc1, tc2 = st.columns(2)
@@ -2062,7 +2069,7 @@ def check_password() -> bool:
     return False
 
 
-def run_us_app(shared_gemini_key: str = ""):
+def run_us_app():
     """美股模式主流程：單一美股個股的完整技術分析（FMP股價 + Gemini AI）。"""
     st.caption("以單一美股個股為分析對象：即時報價、技術指標、型態分析、訊號歷史回測、"
                "規則式風險評估與 Gemini AI 深度分析。")
@@ -2073,8 +2080,9 @@ def run_us_app(shared_gemini_key: str = ""):
                    "要換一組金鑰時，直接在這裡覆蓋掉就可以。")
         fmp_key = st.text_input("FMP API 金鑰", type="password", value=_secret_default("FMP_API_KEY"),
                                  help="至 https://site.financialmodelingprep.com/ 註冊取得")
-        gemini_key = shared_gemini_key
-        st.caption("Gemini API 金鑰已統一在首頁上方輸入，美股、台股分析共用同一組金鑰，這裡不用再輸入一次。")
+        gemini_key = st.text_input("Gemini API 金鑰", type="password", value=_secret_default("GEMINI_API_KEY"),
+                                    key="us_gemini_key_input",
+                                    help="至 https://aistudio.google.com/apikey 註冊取得")
         gemini_model = st.text_input("Gemini 模型名稱", value="gemini-3.5-flash-lite",
                                       help="若出現 404 model not found，請至官方文件確認目前可用模型名稱")
 
@@ -2102,20 +2110,6 @@ def run_us_app(shared_gemini_key: str = ""):
             "作者不對任何投資行為負責，亦不承擔任何損失責任。"
         )
 
-    st.markdown(
-        """
-        <div style="background-color:#eff6ff;border:2px solid #2563eb;border-radius:10px;
-                    padding:16px 20px;margin-top:8px;margin-bottom:14px;">
-            <div style="font-size:1.1rem;font-weight:700;color:#1e3a8a;margin-bottom:4px;">
-                🔍 請輸入欲分析的美股股票代號
-            </div>
-            <div style="font-size:0.88rem;color:#334155;">
-                例如：AAPL（蘋果）、NVDA（輝達）、TSLA（特斯拉）。輸入後按下方「開始分析」按鈕即可。
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
     input_col, target_col, _spacer_col = st.columns([1, 1, 1])
     with input_col:
         symbol = st.text_input(
@@ -2218,6 +2212,23 @@ def run_us_app(shared_gemini_key: str = ""):
             )
             with st.expander("查看送給 Gemini 的完整提示語（prompt）"):
                 st.code(prompt, language="text")
+
+    st.markdown("---")
+    st.header("💬 白話AI解說")
+    st.caption("跟上面「AI 分析」是同一組資料，只是換成完全沒學過技術分析的人也看得懂的白話文版本。")
+    if not gemini_key:
+        st.warning("請先在左側輸入 Gemini API 金鑰才能產生白話AI解說。")
+    else:
+        with st.spinner("AI 正在整理白話解說，請稍候..."):
+            try:
+                beginner_prompt = build_us_beginner_prompt(
+                    symbol, stats, trend=trend, patterns=patterns, quote=quote,
+                    stop_plan=stop_plan, portfolio_check=portfolio_check,
+                )
+                beginner_explanation = call_gemini(beginner_prompt, gemini_key, gemini_model)
+                st.markdown(beginner_explanation)
+            except Exception as exc:
+                st.warning(f"白話AI解說暫時無法產生：{exc}\n\n（不影響上面的分析結果）")
 
     st.markdown("---")
     st.header("📰 新聞情緒分析")
@@ -2537,14 +2548,6 @@ def get_tw_company_info(resolved_symbol: str) -> dict:
         return {}
 
 
-def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["ma5"] = df["close"].rolling(5, min_periods=1).mean()
-    df["ma20"] = df["close"].rolling(20, min_periods=1).mean()
-    df["ma60"] = df["close"].rolling(60, min_periods=1).mean()
-    return df
-
-
 def compute_52week_stats(df: pd.DataFrame, latest_close: float) -> dict:
     """用抓到的歷史資料（最長約一年）估算52週高低點，以及目前價位落在
     這段區間的百分比位置（0%＝貼近最低點，100%＝貼近最高點）。"""
@@ -2620,57 +2623,10 @@ def compute_outlook(trend: dict, patterns: list, relative_strength) -> dict:
             "detail": "目前多空訊號不明顯，屬於觀望階段，可以持續留意後續變化。"}
 
 
-def chart_tw_pattern(df: pd.DataFrame, symbol: str, trend: dict):
-    """台股K線圖：紅漲綠跌（台股慣例，與美股模式的技術指標圖顏色邏輯相反，
-    因此獨立成自己的繪圖函式，不與美股模式的 chart_technical() 共用）。"""
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        row_heights=[0.72, 0.28], vertical_spacing=0.04,
-    )
-
-    fig.add_trace(go.Candlestick(
-        x=df["date"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-        name="K線",
-        increasing=dict(line=dict(color="#dc2626")),
-        decreasing=dict(line=dict(color="#16a34a")),
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["date"], y=df["ma5"], name="MA5",
-                              line=dict(color="#eab308", width=1.2)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["date"], y=df["ma20"], name="MA20",
-                              line=dict(color="#0ea5e9", width=1.2)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["date"], y=df["ma60"], name="MA60",
-                              line=dict(color="#7c3aed", width=1.2)), row=1, col=1)
-
-    if trend.get("resistance") is not None and not pd.isna(trend["resistance"]):
-        fig.add_hline(y=trend["resistance"], line_dash="dot", line_color="#dc2626",
-                       annotation_text=f"近期壓力 {trend['resistance']:.2f}", row=1, col=1)
-    if trend.get("support") is not None and not pd.isna(trend["support"]):
-        fig.add_hline(y=trend["support"], line_dash="dot", line_color="#16a34a",
-                       annotation_text=f"近期支撐 {trend['support']:.2f}", row=1, col=1)
-
-    if "volume" in df.columns:
-        vol_colors = ["#dc2626" if c >= o else "#16a34a"
-                      for o, c in zip(df["open"], df["close"])]
-        fig.add_trace(go.Bar(
-            x=df["date"], y=df["volume"], name="成交量",
-            marker_color=vol_colors, showlegend=False,
-        ), row=2, col=1)
-
-    fig.update_xaxes(rangeslider_visible=False, row=1, col=1)
-    fig.update_xaxes(rangeslider_visible=False, row=2, col=1)
-    fig.update_yaxes(title_text="價格（新台幣）", row=1, col=1)
-    fig.update_yaxes(title_text="成交量", row=2, col=1)
-    fig.update_layout(
-        title=f"{symbol}：K線、均線、成交量與支撐壓力",
-        template="plotly_white", height=680, showlegend=True,
-        margin=dict(l=40, r=20, t=60, b=40),
-    )
-    return fig
-
-
 def build_tw_beginner_prompt(symbol: str, resolved_symbol: str, latest_close: float,
                               latest_date: str, trend: dict, patterns: list, quote=None,
-                              stats52=None, relative_strength=None, company_info=None) -> str:
+                              stats52=None, relative_strength=None, company_info=None,
+                              indicators: dict = None, portfolio_check: dict = None) -> str:
     quote_text = "（本次未取得即時報價，以下以最新收盤價為準）"
     if quote and quote.get("price") is not None:
         chg = quote.get("change")
@@ -2704,6 +2660,22 @@ def build_tw_beginner_prompt(symbol: str, resolved_symbol: str, latest_close: fl
             extra_lines.append(f"- 公司基本資料：{'／'.join(info_bits)}")
     extra_block = ("\n".join(extra_lines) + "\n") if extra_lines else ""
 
+    indicator_block = ""
+    if indicators:
+        indicator_block = (
+            f"- RSI(14)：{_fmt_num(indicators.get('rsi14'), 1)}\n"
+            f"- MACD：{_fmt_num(indicators.get('macd'), 3)} ／訊號線：{_fmt_num(indicators.get('macd_signal'), 3)}\n"
+            f"- KD：K={_fmt_num(indicators.get('kd_k'), 1)}／D={_fmt_num(indicators.get('kd_d'), 1)}\n"
+            f"- 均線：MA5={_fmt_num(indicators.get('ma5'))}／MA20={_fmt_num(indicators.get('ma20'))}"
+            f"／MA60={_fmt_num(indicators.get('ma60'))}\n"
+            f"- OBV（能量潮）：{_fmt_num(indicators.get('obv'), 0)}\n"
+        )
+
+    portfolio_block = (
+        _fmt_portfolio_check_lines(portfolio_check) if portfolio_check
+        else "（本次未上傳交易紀錄，無持倉風控與紀律檢核資料）"
+    )
+
     data_block = f"""
 【{symbol}（實際查詢代號：{resolved_symbol}）資料，更新至 {latest_date}】
 - {quote_text}
@@ -2712,11 +2684,13 @@ def build_tw_beginner_prompt(symbol: str, resolved_symbol: str, latest_close: fl
 - 近期支撐價：{trend.get('support'):.2f} 元／近期壓力價：{trend.get('resistance'):.2f} 元
 - 是否剛突破或跌破：{trend.get('breakout') or '沒有'}
 - 最近5天K線型態：{_fmt_patterns(patterns)}
-{extra_block}"""
+{extra_block}{indicator_block}- 使用者的持倉風控與紀律檢核（規則式計算，非AI生成，若顯示「未上傳交易紀錄」則代表
+  這次沒有這份資料，不要臆測數字）：
+{portfolio_block}"""
 
     prompt = f"""你是一位很會教學、有耐心的股市入門老師，現在要跟一位「完全沒學過技術分析」的
-初學者解釋這支股票最近的走勢型態。這位讀者不知道什麼是支撐、壓力、K線型態，請你完全
-用生活化的白話文解釋，禁止只丟術語不解釋。
+初學者解釋這支股票最近的走勢型態與技術指標。這位讀者不知道什麼是支撐、壓力、K線型態、
+RSI、MACD、KD這些名詞，請你完全用生活化的白話文解釋，禁止只丟術語不解釋。
 
 {data_block}
 
@@ -2728,23 +2702,99 @@ def build_tw_beginner_prompt(symbol: str, resolved_symbol: str, latest_close: fl
 分別是什麼意思（例如：支撐可以想像成地板，壓力可以想像成天花板），再套用到這支股票
 目前的實際價位上。
 
-## 2. 最近K線型態代表什麼
+## 2. 技術指標白話講（RSI／MACD／KD／均線／OBV）
+如果上面有提供這些指標數字，請挑重點用白話解釋現在是偏多還是偏空訊號（例如RSI超過
+70可以想像成「跑得有點喘，可能需要休息」，低於30則是「跌得有點累，可能有機會反彈」），
+不用逐一複誦所有數字，抓重點講就好；如果沒有提供，這段可以省略。
+
+## 3. 最近K線型態代表什麼
 如果上面有偵測到K線型態，請用白話解釋這個型態通常代表市場心理上發生了什麼事
 （例如十字星代表多空雙方勢均力敵，猶豫不決）；如果沒有偵測到型態，就直接說明
 「這幾天沒有出現特別值得注意的型態，屬於正常情況」，不要硬掰一個出來。
 
-## 3. 新手可以怎麼解讀（僅供學習參考）
-用「如果...歷史上這類情況通常...」的方式舉例說明，避免使用「建議買進/賣出」這類
-明確操作指令。務必提醒：這只是根據過去股價統計出的型態參考，不是對未來漲跌的保證，
-也不構成投資建議。
+## 4. 持倉紀律白話提醒
+若上方顯示「未上傳交易紀錄」，這一段只需要寫一句話說明本次未提供持倉資料、故略過。
+若有提供資料，針對曝險比重、現金水位、加碼是否過量、有沒有疑似追高回補這幾項，用
+白話文提醒新手「這代表什麼」，不要另外發明新的百分比或標準。
 
-## 4. 給新手的小提醒
+## 5. 給新手的小提醒
 用1-2句話提醒新手技術分析的限制（例如：型態分析是「落後」於已發生的價格，看到型態
 時價格可能已經反應一部分了），並鼓勵他如果想認真投資，除了型態，也要多了解基本面
-與風險控管，不要只看單一圖表就做決定。
+與風險控管，不要只看單一圖表就做決定。這只是根據過去股價統計出的參考，不是對未來
+漲跌的保證，也不構成投資建議。
 
 請全程使用簡單易懂的白話文，避免使用讀者可能看不懂的專有名詞；若必須使用專有名詞
-（例如支撐、壓力、突破），第一次出現時務必附上白話解釋。全文控制在500字以內。
+（例如支撐、壓力、突破、RSI、MACD、KD），第一次出現時務必附上白話解釋。全文控制在
+650字以內。
+"""
+    return prompt
+
+
+def build_us_beginner_prompt(symbol, stats, trend=None, patterns=None, quote=None,
+                              stop_plan=None, portfolio_check=None) -> str:
+    """給完全新手看的美股白話版AI解說：把上面「Gemini AI 深度分析」已經算好的技術指標、
+    停損停利規則、持倉風控數字，改用生活化的白話文重新講一次給沒學過技術分析的人聽，
+    不重複貼出原始數字表格，語氣像在跟朋友聊天。"""
+    trend = trend or {}
+    patterns = patterns or []
+    stop_plan_block = _fmt_stop_plan_lines(stop_plan) if stop_plan else "（本次未提供停損／停利機制資料）"
+    portfolio_block = (
+        _fmt_portfolio_check_lines(portfolio_check) if portfolio_check
+        else "（本次未上傳交易紀錄，無持倉風控與紀律檢核資料）"
+    )
+
+    data_block = f"""
+【{symbol} 資料，更新至 {stats['latest_date'].date().isoformat()}】
+- 即時報價（僅供對照現在價格）：{_fmt_quote(quote)}
+- 最新收盤價：{_fmt_num(stats['latest_close'])}
+- 近期趨勢：{trend.get('trend', 'N/A')}；支撐 {_fmt_num(trend.get('support'))} ／壓力 {_fmt_num(trend.get('resistance'))}
+{('- 是否剛突破或跌破：' + trend['breakout']) if trend.get('breakout') else ''}
+- RSI(14)：{_fmt_num(stats['latest_rsi'], 1)}（{stats['rsi_signal']}）
+- MACD：{_fmt_num(stats['latest_macd'], 3)} ／訊號線：{_fmt_num(stats['latest_macd_signal'], 3)}（{stats['macd_cross']}）
+- 均線排列：{stats['ma_alignment']}（{stats['ma_cross']}）
+- 布林通道位置：{stats['bb_position']}
+- KD：K={_fmt_num(stats['latest_kd_k'], 1)}／D={_fmt_num(stats['latest_kd_d'], 1)}（{stats['kd_signal']}）
+- 最近K線型態：{_fmt_patterns(patterns)}
+- 使用者自己的停損／停利機制（規則式算好的實際數字，不可自行發明其他百分比）：
+{stop_plan_block}
+- 使用者的持倉風控與紀律檢核（規則式計算，若顯示「未上傳交易紀錄」則代表這次沒有
+  這份資料，不要臆測數字）：
+{portfolio_block}
+"""
+
+    prompt = f"""你是一位很會教學、有耐心的股市入門老師，現在要跟一位「完全沒學過技術分析」的
+初學者解釋這支美股最近的走勢、技術指標，以及他自己設定的停損停利規則目前的狀態。請完全
+用生活化的白話文解釋，禁止只丟術語不解釋，也不要重複貼出上面的數字表格。
+
+{data_block}
+
+請用繁體中文，依照以下架構回答（使用 Markdown 標題，勿使用表格，語氣像在跟朋友聊天但
+保持正確，不要浮誇）：
+
+## 1. 現在股價在做什麼（白話說明）
+用一般人聽得懂的方式，解釋目前是漲勢、跌勢還是盤整，簡單解釋「支撐」跟「壓力」分別
+是什麼（像地板跟天花板），再套用到目前的實際價位上。
+
+## 2. 技術指標白話講
+挑重點用白話解釋 RSI／MACD／KD／均線目前偏多還是偏空（例如RSI超過70可以想像成
+「跑得有點喘，可能需要休息」），不用逐一複誦所有數字。
+
+## 3. 停損停利白話講
+把上面「使用者自己的停損／停利機制」的數字，用白話解釋現在股價距離每一條線大概還有
+多遠、目前是安全還是需要留意，不可自行發明新的百分比或金額，也不可給出「建議買進／
+賣出」之類的操作指令。
+
+## 4. 持倉紀律白話提醒
+若上方顯示「未上傳交易紀錄」，這一段只需要一句話說明本次未提供持倉資料、故略過。若有
+提供資料，針對曝險比重、現金水位、加碼是否過量、有沒有疑似追高回補，用白話文提醒這
+代表什麼，不要另外發明新的百分比或標準。
+
+## 5. 給新手的小提醒
+用1-2句話提醒技術分析的限制，並鼓勵除了技術面，也要多了解基本面與風險控管，不要只看
+單一圖表就做決定。這只是根據過去股價統計出的參考，不是對未來漲跌的保證，也不構成投資
+建議。
+
+請全程使用簡單易懂的白話文，專有名詞第一次出現時務必附上白話解釋。全文控制在650字以內。
 """
     return prompt
 
@@ -2758,8 +2808,20 @@ def get_tw_gemini_key() -> str:
         return ""
 
 
-def run_taiwan_app(shared_gemini_key: str = ""):
-    """台股模式主流程：給完全新手用，輸入代號按一下就能看到型態分析＋白話AI解說。"""
+def run_taiwan_app():
+    """台股模式主流程：給完全新手用，輸入代號按一下就能看到技術指標＋型態分析＋持倉風控＋白話AI解說。"""
+    with st.sidebar:
+        st.header("🔑 Gemini AI 金鑰")
+        st.caption("台股的白話 AI 解說功能需要這組金鑰；已在後台設定好的話會自動帶入，"
+                   "也可以直接在這裡輸入或覆蓋。")
+        gemini_key = st.text_input(
+            "Gemini API 金鑰", type="password", value=_secret_default("GEMINI_API_KEY"),
+            key="tw_gemini_key_input",
+            help="至 https://aistudio.google.com/apikey 免費註冊取得",
+        )
+        st.markdown("---")
+        st.caption("金鑰僅保存於本次瀏覽器 session 記憶體中，不會寫入檔案或上傳。")
+
     st.markdown(
         """
         <div style="text-align:center; padding: 12px 0 4px 0;">
@@ -2796,7 +2858,7 @@ def run_taiwan_app(shared_gemini_key: str = ""):
         st.error("請先輸入股票代號。")
         return
 
-    gemini_key = shared_gemini_key or get_tw_gemini_key()
+    gemini_key = gemini_key or get_tw_gemini_key()
 
     with st.spinner("正在抓取股價資料..."):
         try:
@@ -2805,7 +2867,7 @@ def run_taiwan_app(shared_gemini_key: str = ""):
             st.error(str(exc))
             return
 
-    df = add_moving_averages(df_raw)
+    df = add_indicators(df_raw)
     trend = detect_trend_pattern(df)
     patterns = detect_candlestick_patterns(df)
     quote = fetch_tw_realtime_quote(resolved_symbol)
@@ -2866,7 +2928,25 @@ def run_taiwan_app(shared_gemini_key: str = ""):
         ic4.metric("市值（億元）", f"{company_info['market_cap'] / 1e8:,.0f}" if company_info.get("market_cap") else "N/A")
         st.caption("本益比、殖利率、市值僅供參考，資料可能有延遲或缺漏，正式投資決策請以官方公開資訊為準。")
 
-    st.plotly_chart(chart_tw_pattern(df, symbol_input.strip().upper(), trend), use_container_width=True)
+    st.plotly_chart(chart_technical(df, symbol_input.strip().upper(), STOCK_COLOR, trend=trend),
+                     use_container_width=True)
+
+    st.markdown("##### 📈 技術指標")
+    latest_row = df.iloc[-1]
+    indicators = {
+        "rsi14": latest_row.get("rsi14"), "macd": latest_row.get("macd"),
+        "macd_signal": latest_row.get("macd_signal"), "kd_k": latest_row.get("kd_k"),
+        "kd_d": latest_row.get("kd_d"), "ma5": latest_row.get("ma5"),
+        "ma20": latest_row.get("ma20"), "ma60": latest_row.get("ma60"),
+        "obv": latest_row.get("obv"),
+    }
+    ind1, ind2, ind3, ind4 = st.columns(4)
+    ind1.metric("RSI(14)", f"{indicators['rsi14']:.1f}")
+    ind2.metric("MACD ／訊號線", f"{indicators['macd']:.2f} ／ {indicators['macd_signal']:.2f}")
+    ind3.metric("KD (K／D)", f"{indicators['kd_k']:.1f} ／ {indicators['kd_d']:.1f}")
+    ind4.metric("OBV（能量潮）", f"{indicators['obv']:,.0f}")
+    st.caption("RSI 一般以70以上偏過熱、30以下偏過冷作為參考；KD、MACD 則觀察黃金交叉／死亡交叉；"
+               "以上僅為歷史資料統計，不代表未來走勢，詳細解讀可參考下方白話AI解說。")
 
     st.markdown("##### 🔍 型態分析結果")
     tc1, tc2 = st.columns(2)
@@ -2897,6 +2977,9 @@ def run_taiwan_app(shared_gemini_key: str = ""):
         st.caption("「相對表現」是這支股票漲跌幅減掉大盤漲跌幅，數字越大代表比大盤強勢。")
 
     st.markdown("---")
+    portfolio_check = render_portfolio_discipline_section(symbol_input.strip().upper(), df)
+
+    st.markdown("---")
     st.markdown("##### 🤖 AI 白話解說")
 
     if not gemini_key:
@@ -2911,7 +2994,8 @@ def run_taiwan_app(shared_gemini_key: str = ""):
                     symbol_input.strip().upper(), resolved_symbol, latest_close,
                     latest_date, trend, patterns, quote=quote,
                     stats52=stats52, relative_strength=relative_strength,
-                    company_info=company_info,
+                    company_info=company_info, indicators=indicators,
+                    portfolio_check=portfolio_check,
                 )
                 explanation = call_gemini(prompt, gemini_key)
                 st.markdown(explanation)
@@ -2945,60 +3029,20 @@ def main():
         unsafe_allow_html=True,
     )
 
-    st.markdown("##### 🔑 Gemini AI 金鑰")
-    shared_gemini_key = st.text_input(
-        "Gemini API 金鑰（美股、台股分析共用；已在後台設定好的話會自動帶入，也可以直接在這裡輸入）",
-        type="password",
-        value=_secret_default("GEMINI_API_KEY"),
-        key="shared_gemini_key_input",
-        help="至 https://aistudio.google.com/apikey 免費註冊取得",
-    )
-    st.caption("金鑰僅保存於本次瀏覽器 session 記憶體中，不會寫入檔案或上傳。輸入好金鑰後，"
-               "下方選擇市場、輸入股票代號即可直接得到 AI 分析結果。")
+    with st.sidebar:
+        st.header("📍 選擇市場")
+        market_label = st.radio(
+            "請選擇要分析的市場",
+            ["🇺🇸 美股", "🇹🇼 台股"],
+            key="market_selector",
+            label_visibility="collapsed",
+        )
+        st.markdown("---")
 
-    st.markdown(
-        """
-        <style>
-        div[data-testid="stButton"] button {
-            font-size: 1.25rem;
-            font-weight: 700;
-            padding: 0.9rem 0.6rem;
-            border-radius: 12px;
-            height: auto;
-            white-space: normal;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown("**請選擇要分析的市場**")
-    if "market_selector" not in st.session_state:
-        st.session_state["market_selector"] = "us"
-
-    mcol1, mcol2 = st.columns(2)
-    with mcol1:
-        if st.button(
-            "🇺🇸 美股\n（進階：技術指標＋停損停利＋持倉風控）",
-            key="market_btn_us",
-            type="primary" if st.session_state["market_selector"] == "us" else "secondary",
-            use_container_width=True,
-        ):
-            st.session_state["market_selector"] = "us"
-    with mcol2:
-        if st.button(
-            "🇹🇼 台股\n（新手：型態分析＋白話AI解說）",
-            key="market_btn_tw",
-            type="primary" if st.session_state["market_selector"] == "tw" else "secondary",
-            use_container_width=True,
-        ):
-            st.session_state["market_selector"] = "tw"
-
-    st.markdown("---")
-
-    if st.session_state["market_selector"] == "us":
-        run_us_app(shared_gemini_key=shared_gemini_key)
+    if market_label.startswith("🇺🇸"):
+        run_us_app()
     else:
-        run_taiwan_app(shared_gemini_key=shared_gemini_key)
+        run_taiwan_app()
 
 
 if __name__ == "__main__":
