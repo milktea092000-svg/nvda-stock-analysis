@@ -1119,42 +1119,209 @@ def build_quick_recommendation(stats: dict):
 # ----------------------------------------------------------------------------
 
 def detect_candlestick_patterns(df: pd.DataFrame, lookback: int = 5) -> list:
-    """掃描最近 lookback 天的 K 線，辨識幾種常見的單根／雙根蠟燭型態。
+    """掃描最近 lookback 天的 K 線，辨識較完整的單根／雙根／三根蠟燭型態
+    （十字星、鎚子線／吊人線、倒鎚子線／流星、吞噬、烏雲蓋頂／刺透線、
+    母子線（孕線）、晨星／暮星、三白兵／三黑鴉）。
 
     回傳 [(日期, 型態名稱, 意涵), ...]，僅偵測型態明顯（比例夠極端）的情況，
-    避免雜訊過多。這是簡化版規則判斷，非嚴謹的專業技術分析軟體演算法。
+    避免雜訊過多。這是規則式判斷（非影像辨識），比較接近專業技術分析教科書
+    常見的型態清單，但仍是簡化版，非嚴謹的專業技術分析軟體演算法。
     """
     patterns = []
-    recent = df.tail(lookback + 1).reset_index(drop=True)
+    # 三根K棒型態（晨星/暮星/三兵/三鴉）最多往前多看2根，lookback+3 確保够用。
+    recent = df.tail(lookback + 3).reset_index(drop=True)
+    n = len(recent)
+    start = max(1, n - lookback)
 
-    for i in range(1, len(recent)):
-        row = recent.iloc[i]
+    def _body_shadow(row):
         o, h, l, c = row["open"], row["high"], row["low"], row["close"]
         rng = (h - l) if h != l else 1e-9
         body = abs(c - o)
-        upper_shadow = h - max(o, c)
-        lower_shadow = min(o, c) - l
-        date_str = row["date"].date().isoformat()
+        upper = h - max(o, c)
+        lower = min(o, c) - l
+        return o, h, l, c, rng, body, upper, lower
 
+    for i in range(start, n):
+        row = recent.iloc[i]
+        o, h, l, c, rng, body, upper_shadow, lower_shadow = _body_shadow(row)
+        date_str = row["date"].date().isoformat()
+        prev = recent.iloc[i - 1]
+        p_o, p_h, p_l, p_c, p_rng, p_body, p_upper, p_lower = _body_shadow(prev)
+
+        # ---- 單根型態 ----
         if body / rng < 0.1:
             patterns.append((date_str, "十字星（Doji）", "多空拉鋸，可能為反轉前兆"))
 
         if lower_shadow > body * 2 and upper_shadow < body * 0.5 and body / rng < 0.4:
-            prev_close = recent.iloc[i - 1]["close"]
-            if c < prev_close:
+            if c < p_c:
                 patterns.append((date_str, "鎚子線（Hammer）", "跌勢中出現，留意止跌反彈"))
             else:
                 patterns.append((date_str, "吊人線（Hanging Man）", "漲勢中出現，留意反轉向下"))
 
-        prev = recent.iloc[i - 1]
-        prev_top, prev_bottom = max(prev["open"], prev["close"]), min(prev["open"], prev["close"])
+        if upper_shadow > body * 2 and lower_shadow < body * 0.5 and body / rng < 0.4:
+            if c < p_c:
+                patterns.append((date_str, "倒鎚子線（Inverted Hammer）", "跌勢中出現，留意止跌反彈訊號（需隔日確認）"))
+            else:
+                patterns.append((date_str, "流星（Shooting Star）", "漲勢中出現，留意反轉向下訊號"))
+
+        # ---- 雙根型態 ----
+        prev_top, prev_bottom = max(p_o, p_c), min(p_o, p_c)
         curr_top, curr_bottom = max(o, c), min(o, c)
-        if c > o and prev["close"] < prev["open"] and curr_top >= prev_top and curr_bottom <= prev_bottom:
+        if c > o and p_c < p_o and curr_top >= prev_top and curr_bottom <= prev_bottom:
             patterns.append((date_str, "看漲吞噬（Bullish Engulfing）", "偏多反轉訊號"))
-        elif c < o and prev["close"] > prev["open"] and curr_top >= prev_top and curr_bottom <= prev_bottom:
+        elif c < o and p_c > p_o and curr_top >= prev_top and curr_bottom <= prev_bottom:
             patterns.append((date_str, "看跌吞噬（Bearish Engulfing）", "偏空反轉訊號"))
 
+        if curr_top <= prev_top and curr_bottom >= prev_bottom and body < p_body * 0.6 and p_body / p_rng > 0.5:
+            if p_c > p_o:
+                patterns.append((date_str, "母子線／孕線（Bearish Harami）", "漲勢後出現，動能縮小，留意反轉或休息"))
+            else:
+                patterns.append((date_str, "母子線／孕線（Bullish Harami）", "跌勢後出現，動能縮小，留意止跌或反彈"))
+
+        if p_c > p_o and p_body / p_rng > 0.5 and c < o and o > p_h and c < (p_o + p_c) / 2 and c > p_o:
+            patterns.append((date_str, "烏雲蓋頂（Dark Cloud Cover）", "漲勢中出現，偏空反轉訊號"))
+        if p_c < p_o and p_body / p_rng > 0.5 and c > o and o < p_l and c > (p_o + p_c) / 2 and c < p_o:
+            patterns.append((date_str, "刺透線（Piercing Pattern）", "跌勢中出現，偏多反轉訊號"))
+
+        # ---- 三根型態（需要再前一根 prev2）----
+        if i >= 2:
+            prev2 = recent.iloc[i - 2]
+            p2_o, p2_h, p2_l, p2_c, p2_rng, p2_body, p2_upper, p2_lower = _body_shadow(prev2)
+
+            # 晨星 Morning Star：長黑 → 小實體（跳空）→ 長紅收進第一根實體一半以上
+            if (p2_c < p2_o and p2_body / p2_rng > 0.5
+                    and p_body / p_rng < 0.35 and max(p_o, p_c) < p2_c
+                    and c > o and body / rng > 0.5 and c > (p2_o + p2_c) / 2):
+                patterns.append((date_str, "晨星（Morning Star）", "跌勢中的三日反轉型態，偏多訊號"))
+
+            # 暮星 Evening Star：長紅 → 小實體（跳空）→ 長黑收進第一根實體一半以下
+            if (p2_c > p2_o and p2_body / p2_rng > 0.5
+                    and p_body / p_rng < 0.35 and min(p_o, p_c) > p2_c
+                    and c < o and body / rng > 0.5 and c < (p2_o + p2_c) / 2):
+                patterns.append((date_str, "暮星（Evening Star）", "漲勢中的三日反轉型態，偏空訊號"))
+
+            # 三白兵 Three White Soldiers：連三根實體夠大的紅K，一根比一根高
+            if (p2_c > p2_o and p_c > p_o and c > o
+                    and p2_body / p2_rng > 0.4 and p_body / p_rng > 0.4 and body / rng > 0.4
+                    and p_c > p2_c and c > p_c):
+                patterns.append((date_str, "三白兵（Three White Soldiers）", "連續三日強勢上漲，偏多訊號"))
+
+            # 三黑鴉 Three Black Crows：連三根實體夠大的黑K，一根比一根低
+            if (p2_c < p2_o and p_c < p_o and c < o
+                    and p2_body / p2_rng > 0.4 and p_body / p_rng > 0.4 and body / rng > 0.4
+                    and p_c < p2_c and c < p_c):
+                patterns.append((date_str, "三黑鴉（Three Black Crows）", "連續三日強勢下跌，偏空訊號"))
+
     return patterns
+
+
+def _find_swing_points(series: pd.Series, order: int = 4):
+    """簡易轉折點（局部高點／低點）偵測：某個點前後 order 根K棒的值都比它低（或高），
+    就視為一個轉折高點（或低點）。回傳 (高點index清單, 低點index清單)，index 以傳入
+    series 的位置為準（由左到右遞增排列）。這是教科書型態學（雙重頂/底、頭肩頂/底）
+    判斷的基礎，純量化規則，非影像辨識，僅供輔助參考。"""
+    values = series.values
+    n = len(values)
+    highs, lows = [], []
+    for i in range(order, n - order):
+        window = values[i - order:i + order + 1]
+        if values[i] == window.max() and (window == values[i]).sum() == 1:
+            highs.append(i)
+        if values[i] == window.min() and (window == values[i]).sum() == 1:
+            lows.append(i)
+    return highs, lows
+
+
+def detect_chart_patterns(df: pd.DataFrame, lookback: int = 120, order: int = 4,
+                           tolerance: float = 0.035) -> list:
+    """在較長區間（預設近120天）用轉折高低點掃描，嘗試辨識經典的「型態學」價格排列：
+    雙重頂／雙重底、頭肩頂／頭肩底，並判斷頸線是否已被跌破／突破（型態是否「確認」）。
+
+    這是規則式簡化判斷（找轉折點＋比對價位相近程度），不是影像辨識等級的精確比對，
+    提供「可能的型態＋頸線價位＋目前是否已確認」給使用者與AI參考，不構成投資建議。
+    """
+    recent = df.tail(lookback).reset_index(drop=True)
+    if len(recent) < order * 2 + 5:
+        return []
+
+    high_idx, _ = _find_swing_points(recent["high"], order)
+    _, low_idx = _find_swing_points(recent["low"], order)
+    latest_close = recent["close"].iloc[-1]
+    results = []
+
+    if len(high_idx) >= 2:
+        i1, i2 = high_idx[-2], high_idx[-1]
+        h1, h2 = recent["high"].iloc[i1], recent["high"].iloc[i2]
+        if abs(h1 - h2) / max(h1, h2) <= tolerance:
+            between = [j for j in low_idx if i1 < j < i2]
+            if between:
+                neckline = recent["low"].iloc[between].min()
+                broken = latest_close < neckline
+                results.append({
+                    "pattern": "雙重頂（Double Top）", "bias": "偏空", "neckline": float(neckline),
+                    "confirmed": bool(broken),
+                    "detail": f"兩個高點約在 {h1:.2f} 與 {h2:.2f}（相差 {abs(h1-h2)/max(h1,h2)*100:.1f}%），"
+                              f"中間頸線（支撐）約 {neckline:.2f}，"
+                              + ("目前股價已跌破頸線，型態偏向確認。" if broken else "目前股價尚未跌破頸線，型態尚未確認。"),
+                })
+
+    if len(low_idx) >= 2:
+        i1, i2 = low_idx[-2], low_idx[-1]
+        l1, l2 = recent["low"].iloc[i1], recent["low"].iloc[i2]
+        if abs(l1 - l2) / max(l1, l2) <= tolerance:
+            between = [j for j in high_idx if i1 < j < i2]
+            if between:
+                neckline = recent["high"].iloc[between].max()
+                broken = latest_close > neckline
+                results.append({
+                    "pattern": "雙重底（Double Bottom）", "bias": "偏多", "neckline": float(neckline),
+                    "confirmed": bool(broken),
+                    "detail": f"兩個低點約在 {l1:.2f} 與 {l2:.2f}（相差 {abs(l1-l2)/max(l1,l2)*100:.1f}%），"
+                              f"中間頸線（壓力）約 {neckline:.2f}，"
+                              + ("目前股價已突破頸線，型態偏向確認。" if broken else "目前股價尚未突破頸線，型態尚未確認。"),
+                })
+
+    if len(high_idx) >= 3:
+        i1, i2, i3 = high_idx[-3], high_idx[-2], high_idx[-1]
+        h1, h2, h3 = recent["high"].iloc[i1], recent["high"].iloc[i2], recent["high"].iloc[i3]
+        if h2 > h1 and h2 > h3 and abs(h1 - h3) / max(h1, h3) <= tolerance * 1.5:
+            lows_between = [recent["low"].iloc[j] for j in low_idx if i1 < j < i3]
+            if len(lows_between) >= 2:
+                neckline = float(np.mean(lows_between))
+                broken = latest_close < neckline
+                results.append({
+                    "pattern": "頭肩頂（Head and Shoulders Top）", "bias": "偏空", "neckline": neckline,
+                    "confirmed": bool(broken),
+                    "detail": f"左肩 {h1:.2f}／頭 {h2:.2f}／右肩 {h3:.2f}，頸線約 {neckline:.2f}，"
+                              + ("目前股價已跌破頸線，型態偏向確認。" if broken else "目前股價尚未跌破頸線，型態尚未確認。"),
+                })
+
+    if len(low_idx) >= 3:
+        i1, i2, i3 = low_idx[-3], low_idx[-2], low_idx[-1]
+        l1, l2, l3 = recent["low"].iloc[i1], recent["low"].iloc[i2], recent["low"].iloc[i3]
+        if l2 < l1 and l2 < l3 and abs(l1 - l3) / max(l1, l3) <= tolerance * 1.5:
+            highs_between = [recent["high"].iloc[j] for j in high_idx if i1 < j < i3]
+            if len(highs_between) >= 2:
+                neckline = float(np.mean(highs_between))
+                broken = latest_close > neckline
+                results.append({
+                    "pattern": "頭肩底（Inverse Head and Shoulders）", "bias": "偏多", "neckline": neckline,
+                    "confirmed": bool(broken),
+                    "detail": f"左肩 {l1:.2f}／頭 {l2:.2f}／右肩 {l3:.2f}，頸線約 {neckline:.2f}，"
+                              + ("目前股價已突破頸線，型態偏向確認。" if broken else "目前股價尚未突破頸線，型態尚未確認。"),
+                })
+
+    return results
+
+
+def _fmt_chart_patterns(chart_patterns: list) -> str:
+    if not chart_patterns:
+        return "（近期未偵測到雙重頂/底或頭肩頂/底等型態，這是正常情況）"
+    lines = []
+    for p in chart_patterns:
+        status = "已確認" if p["confirmed"] else "尚未確認"
+        lines.append(f"- {p['pattern']}（{p['bias']}，{status}）：{p['detail']}")
+    return "\n".join(lines)
 
 
 def detect_trend_pattern(df: pd.DataFrame, short_win: int = 20, breakout_win: int = 20) -> dict:
@@ -1463,7 +1630,8 @@ def _fmt_quote(quote) -> str:
 
 
 def build_prompt(symbol, stats, start_date, end_date, trend=None, patterns=None,
-                  backtest=None, quote=None, stop_plan=None, portfolio_check=None) -> str:
+                  backtest=None, quote=None, stop_plan=None, portfolio_check=None,
+                  chart_patterns=None) -> str:
     """建構送給 Gemini 的分析提示語（單一個股獨立分析）。
 
     設計重點：
@@ -1499,6 +1667,8 @@ def build_prompt(symbol, stats, start_date, end_date, trend=None, patterns=None,
 - 趨勢型態：{trend.get('trend', 'N/A')}；支撐 {_fmt_num(trend.get('support'))} ／壓力 {_fmt_num(trend.get('resistance'))}
   {('；' + trend['breakout']) if trend.get('breakout') else ''}
 - 近期K線型態：{_fmt_patterns(patterns)}
+- 較長期價格排列型態（雙重頂/底、頭肩頂/底，規則式轉折點掃描）：
+{_fmt_chart_patterns(chart_patterns)}
 - 訊號歷史回測（隔日上漲機率）：
 {_fmt_backtest(backtest)}
 - 使用者自己的停損／停利機制（規則式計算，非AI生成，以下數字為畫面上實際顯示的數字，
@@ -1519,9 +1689,12 @@ def build_prompt(symbol, stats, start_date, end_date, trend=None, patterns=None,
 請嚴格依照以下框架，用繁體中文輸出分析報告（使用 Markdown 標題，勿使用表格）：
 
 ## 1. 技術面與型態面分析
-整合解讀 RSI、MACD、KD、均線排列、布林通道位置，以及偵測到的K線型態與趨勢/突破狀況，判斷目前多空
-力道與可信度（例如指標是否互相驗證，或出現分歧訊號），並根據 OBV 與價格走勢是否同步，判斷目前量能
-是否真的支撐價格趨勢（量價同步代表動能可信，量價背離則需提高警覺）。
+整合解讀 RSI、MACD、KD、均線排列、布林通道位置，以及偵測到的K線型態（含晨星/暮星、三白兵/三黑鴉、
+烏雲蓋頂/刺透線等多根K棒型態）與趨勢/突破狀況，判斷目前多空力道與可信度（例如指標是否互相驗證，或
+出現分歧訊號），並根據 OBV 與價格走勢是否同步，判斷目前量能是否真的支撐價格趨勢（量價同步代表動能
+可信，量價背離則需提高警覺）。若上方「較長期價格排列型態」有偵測到雙重頂/底或頭肩頂/底，也要納入
+判斷，並明確說明該型態目前是「已確認（頸線已突破/跌破）」還是「尚未確認」，未確認的型態只能當作
+觀察中的可能性，不可當成已發生的事實描述。
 
 ## 2. 訊號可靠度（依歷史回測）
 針對目前顯示的主要訊號（例如MACD黃金交叉、RSI超賣等），對照上方提供的「歷史回測勝率」數字，說明這個
@@ -1788,44 +1961,62 @@ def render_playbook_stop_plan(stop_plan: dict):
                "也不構成投資建議；實際執行仍請自行確認部位身份（新加碼／核心持倉）與基本面狀況。")
 
 
-def render_portfolio_discipline_section(symbol: str, price_df: pd.DataFrame):
-    """選填區塊：使用者上傳自己的交易紀錄 CSV，並手動輸入帳戶總資產／現金水位／目標總倉位，
-    才會顯示「單一股票最大曝險35%」「現金防禦率15%~20%」「單次加碼上限25%」「分批建倉A/B/C型態」
-    「反FOMO回補紀律」這幾項需要知道實際持倉狀態才能判斷的規則（範本第一、二、四節）。
+def render_portfolio_inputs_sidebar():
+    """持倉風控的輸入區塊（交易紀錄 CSV＋帳戶總資產／現金水位／目標總倉位），
+    放在側邊欄、跟 API 金鑰設定放在一起，在按下「開始分析」之前就可以先準備好，
+    避免原本放在結果頁內、跟其他小工具（例如下面的檔案上傳）互動時觸發 Streamlit
+    重新執行整個腳本、導致又跳回最前面「尚未分析」畫面的問題。
+    不上傳交易紀錄的話，完全不影響技術面分析，回傳的 dict 裡 trade_file 會是 None。
+    """
+    st.header("📊 持倉風控設定（選填）")
+    st.caption(
+        "上傳你自己的交易紀錄 CSV，分析時會一併算出「單一股票曝險」「加碼比例」「分批建倉型態」"
+        "「反FOMO回補」這幾項持倉紀律檢核——這支工具本身不記得你的持倉狀態，每次分析都需要重新"
+        "上傳（不會存到雲端）。不上傳的話完全不影響技術面分析。"
+    )
+    trade_file = st.file_uploader(
+        "交易紀錄 CSV（欄位：Date, Type, Symbol, Name, Price, Quantity, Reason）",
+        type=["csv"], key="trade_log_uploader",
+    )
+    total_account_assets = st.number_input(
+        "帳戶總資產（所有持股＋現金，選填）", min_value=0.0, value=0.0, step=1000.0,
+        key="pf_total_assets",
+        help="用於「單一股票最大曝險35%」與「現金防禦水位15%~20%」這兩項的計算基準；留空或填0則不計算這兩項。",
+    )
+    cash_amount = st.number_input(
+        "目前現金／高流動資產水位（選填）", min_value=0.0, value=0.0, step=1000.0, key="pf_cash_amount",
+    )
+    target_total_position = st.number_input(
+        "目標總倉位（股數，選填）", min_value=0.0, value=0.0, step=1.0, key="pf_target_position",
+        help="用於「單次加碼上限不得超過目標總倉位25%」的計算基準；留空或填0則不計算這一項。",
+    )
+    return {
+        "trade_file": trade_file,
+        "total_account_assets": total_account_assets,
+        "cash_amount": cash_amount,
+        "target_total_position": target_total_position,
+    }
+
+
+def render_portfolio_discipline_section(symbol: str, price_df: pd.DataFrame, portfolio_inputs: dict):
+    """選填區塊：使用左側欄位（render_portfolio_inputs_sidebar）收集到的交易紀錄 CSV，
+    與帳戶總資產／現金水位／目標總倉位，計算並顯示「單一股票最大曝險35%」「現金防禦率
+    15%~20%」「單次加碼上限25%」「分批建倉A/B/C型態」「反FOMO回補紀律」這幾項需要知道
+    實際持倉狀態才能判斷的規則（範本第一、二、四節）。
 
     不上傳交易紀錄的話，這個區塊只顯示說明文字，不影響上方原本的個股技術面分析。
     回傳 portfolio_check dict（供 AI 分析與下載報告引用）；未上傳交易紀錄時回傳 None。
     """
     st.markdown("##### 📊 持倉風控與紀律檢核（選填功能）")
-    st.caption(
-        f"以下需要你上傳自己的 {symbol} 交易紀錄 CSV，才能算出「單一股票曝險」「加碼比例」"
-        "「分批建倉型態」「反FOMO回補」這幾項——這支工具本身不記得你的持倉狀態，"
-        "每次分析都需要重新上傳（不會存到雲端）。不上傳的話完全不影響上方的技術面分析。"
-    )
 
-    trade_file = st.file_uploader(
-        f"上傳 {symbol} 的交易紀錄 CSV（欄位：Date, Type, Symbol, Name, Price, Quantity, Reason）",
-        type=["csv"], key="trade_log_uploader",
-    )
-
-    colp1, colp2, colp3 = st.columns(3)
-    with colp1:
-        total_account_assets = st.number_input(
-            "帳戶總資產（所有持股＋現金，選填）", min_value=0.0, value=0.0, step=1000.0,
-            help="用於「單一股票最大曝險35%」與「現金防禦水位15%~20%」這兩項的計算基準；留空或填0則不計算這兩項。",
-        )
-    with colp2:
-        cash_amount = st.number_input(
-            "目前現金／高流動資產水位（選填）", min_value=0.0, value=0.0, step=1000.0,
-        )
-    with colp3:
-        target_total_position = st.number_input(
-            f"{symbol} 目標總倉位（股數，選填）", min_value=0.0, value=0.0, step=1.0,
-            help="用於「單次加碼上限不得超過目標總倉位25%」的計算基準；留空或填0則不計算這一項。",
-        )
+    trade_file = portfolio_inputs.get("trade_file")
+    total_account_assets = portfolio_inputs.get("total_account_assets", 0.0)
+    cash_amount = portfolio_inputs.get("cash_amount", 0.0)
+    target_total_position = portfolio_inputs.get("target_total_position", 0.0)
 
     if trade_file is None:
-        st.info("尚未上傳交易紀錄，以上四個欄位可先不用理會。")
+        st.info(f"尚未在左側上傳 {symbol} 的交易紀錄 CSV，以下不會顯示持倉風控檢核結果"
+                "（完全不影響上方的技術面分析）。")
         return None
 
     try:
@@ -1924,7 +2115,7 @@ def render_portfolio_discipline_section(symbol: str, price_df: pd.DataFrame):
 
 
 def render_stock_section(symbol, color, df, stats, trend, patterns, backtest, stop_plan,
-                          quote=None, quote_error=None):
+                          quote=None, quote_error=None, chart_patterns=None):
     """單一個股的完整分析區塊：即時報價 → 技術指標圖 → 型態分析 → 訊號回測 → 投資建議與風險評估。"""
     render_realtime_quote(symbol, quote, quote_error)
 
@@ -1947,11 +2138,20 @@ def render_stock_section(symbol, color, df, stats, trend, patterns, backtest, st
                 st.markdown(f"- **{d}｜{name}**：{meaning}")
         else:
             st.caption(
-                "已檢查最近5天的K線資料，但沒有偵測到本工具支援辨識的型態"
-                "（十字星／鎚子線／吊人線／吞噬型態）——這是「有資料、但這幾天"
-                "沒出現這幾種型態」，不是資料抓取失敗，屬於正常情況。"
+                "已檢查最近幾天的K線資料，但沒有偵測到本工具支援辨識的單根／多根K線型態"
+                "——這是「有資料、但這幾天沒出現這幾種型態」，不是資料抓取失敗，屬於正常情況。"
             )
-        st.caption("型態辨識為簡化版規則演算法，非專業技術分析軟體等級的完整判斷，僅供輔助參考。")
+
+    st.markdown("**較長期價格排列型態（雙重頂/底、頭肩頂/底）**")
+    if chart_patterns:
+        for p in chart_patterns:
+            status = "✅ 已確認" if p["confirmed"] else "⏳ 尚未確認"
+            box = st.warning if p["bias"] == "偏空" else st.success
+            box(f"**{p['pattern']}**（{status}）\n\n{p['detail']}")
+    else:
+        st.caption("已掃描近期較長區間的轉折高低點，但沒有偵測到雙重頂/底或頭肩頂/底等型態，屬於正常情況。")
+    st.caption("以上型態辨識皆為規則式演算法（抓轉折點、比對K棒比例），非影像辨識或專業技術分析軟體等級的"
+               "完整判斷，型態是否「確認」以頸線是否被實際突破／跌破為準，僅供輔助參考，不構成投資建議。")
 
     st.markdown("##### 🧪 訊號回測（歷史勝率）")
     st.plotly_chart(chart_backtest(backtest, symbol, color), use_container_width=True)
@@ -1985,7 +2185,7 @@ def render_stock_section(symbol, color, df, stats, trend, patterns, backtest, st
 
 def build_markdown_report(symbol, stats, start_date, end_date, ai_analysis: str,
                            trend=None, patterns=None, backtest=None, quote=None, stop_plan=None,
-                           portfolio_check=None) -> str:
+                           portfolio_check=None, chart_patterns=None) -> str:
     trend = trend or {}
     patterns = patterns or []
 
@@ -2013,7 +2213,8 @@ def build_markdown_report(symbol, stats, start_date, end_date, ai_analysis: str,
         f"布林通道：{stats['bb_position']}；KD：{stats['kd_cross']}（{stats['kd_signal']}）"
         + (f"；{trend['breakout']}" if trend.get('breakout') else ""),
         f"- OBV（能量潮）：{stats['obv_signal']}",
-        f"- 近期K線型態：{_fmt_patterns(patterns)}\n",
+        f"- 近期K線型態：{_fmt_patterns(patterns)}",
+        f"- 較長期價格排列型態：\n{_fmt_chart_patterns(chart_patterns)}\n",
         f"## 訊號回測（隔日上漲機率）\n",
         _fmt_backtest(backtest),
         f"\n\n## 統計摘要\n",
@@ -2101,6 +2302,9 @@ def run_us_app():
                    "不影響其餘分析功能。")
 
         st.markdown("---")
+        portfolio_inputs = render_portfolio_inputs_sidebar()
+
+        st.markdown("---")
         st.caption("金鑰僅保存於本次瀏覽器 session 記憶體中，不會寫入檔案或上傳。")
         st.markdown("### 📢 免責聲明")
         st.caption(
@@ -2128,7 +2332,17 @@ def run_us_app():
 
     run = st.button("🚀 開始分析", type="primary", use_container_width=False)
 
-    if not run:
+    if "us_analyzed" not in st.session_state:
+        st.session_state["us_analyzed"] = False
+    if run:
+        st.session_state["us_analyzed"] = True
+
+    # 用 session_state 記住「已經按過開始分析」，而不是只看這次重新執行時 run 是否為
+    # True：按鈕本身只有在真正被點擊的那一次重新執行才會是 True，之後只要頁面上任何
+    # 一個小工具被互動（例如下方持倉風控的檔案上傳、st.file_uploader 本身也在側邊欄），
+    # Streamlit 都會重新整個執行一次腳本，屆時 run 會變回 False；如果還是用「if not run:
+    # return」判斷，結果就會「跳回」最前面「尚未分析」的畫面，讓人誤以為上傳失敗。
+    if not st.session_state["us_analyzed"]:
         st.info("填好左側 API 金鑰與上方股票代號後，按下「開始分析」即可。")
         return
 
@@ -2161,6 +2375,7 @@ def run_us_app():
     stats = compute_stats(df)
     trend = detect_trend_pattern(df)
     patterns = detect_candlestick_patterns(df)
+    chart_patterns = detect_chart_patterns(df)
     backtest = backtest_signals(df)
     stop_plan = compute_playbook_stop_plan(df, trend, custom_target_price=custom_target_price)
 
@@ -2179,10 +2394,10 @@ def run_us_app():
     st.markdown("##### 📊 績效摘要")
     render_performance_summary(stats)
     render_stock_section(symbol, STOCK_COLOR, df, stats, trend, patterns, backtest, stop_plan,
-                          quote=quote, quote_error=quote_err)
+                          quote=quote, quote_error=quote_err, chart_patterns=chart_patterns)
 
     st.markdown("---")
-    portfolio_check = render_portfolio_discipline_section(symbol, df)
+    portfolio_check = render_portfolio_discipline_section(symbol, df, portfolio_inputs)
 
     st.markdown("---")
     st.header("🤖 AI 分析")
@@ -2192,7 +2407,8 @@ def run_us_app():
         with st.spinner("正在請 Gemini 進行分析，請稍候..."):
             prompt = build_prompt(symbol, stats, start_date, end_date,
                                    trend=trend, patterns=patterns, backtest=backtest, quote=quote,
-                                   stop_plan=stop_plan, portfolio_check=portfolio_check)
+                                   stop_plan=stop_plan, portfolio_check=portfolio_check,
+                                   chart_patterns=chart_patterns)
             try:
                 analysis = call_gemini(prompt, gemini_key, gemini_model)
             except Exception as exc:
@@ -2203,7 +2419,8 @@ def run_us_app():
             st.markdown(analysis, unsafe_allow_html=True)
             report_md = build_markdown_report(symbol, stats, start_date, end_date, analysis,
                                                trend=trend, patterns=patterns, backtest=backtest,
-                                               quote=quote, stop_plan=stop_plan, portfolio_check=portfolio_check)
+                                               quote=quote, stop_plan=stop_plan, portfolio_check=portfolio_check,
+                                               chart_patterns=chart_patterns)
             st.download_button(
                 "📥 下載完整分析報告（Markdown）",
                 data=report_md.encode("utf-8"),
@@ -2224,6 +2441,7 @@ def run_us_app():
                 beginner_prompt = build_us_beginner_prompt(
                     symbol, stats, trend=trend, patterns=patterns, quote=quote,
                     stop_plan=stop_plan, portfolio_check=portfolio_check,
+                    chart_patterns=chart_patterns,
                 )
                 beginner_explanation = call_gemini(beginner_prompt, gemini_key, gemini_model)
                 st.markdown(beginner_explanation)
@@ -2626,7 +2844,8 @@ def compute_outlook(trend: dict, patterns: list, relative_strength) -> dict:
 def build_tw_beginner_prompt(symbol: str, resolved_symbol: str, latest_close: float,
                               latest_date: str, trend: dict, patterns: list, quote=None,
                               stats52=None, relative_strength=None, company_info=None,
-                              indicators: dict = None, portfolio_check: dict = None) -> str:
+                              indicators: dict = None, portfolio_check: dict = None,
+                              chart_patterns: list = None) -> str:
     quote_text = "（本次未取得即時報價，以下以最新收盤價為準）"
     if quote and quote.get("price") is not None:
         chg = quote.get("change")
@@ -2684,6 +2903,8 @@ def build_tw_beginner_prompt(symbol: str, resolved_symbol: str, latest_close: fl
 - 近期支撐價：{trend.get('support'):.2f} 元／近期壓力價：{trend.get('resistance'):.2f} 元
 - 是否剛突破或跌破：{trend.get('breakout') or '沒有'}
 - 最近5天K線型態：{_fmt_patterns(patterns)}
+- 較長期價格排列型態（雙重頂/底、頭肩頂/底）：
+{_fmt_chart_patterns(chart_patterns)}
 {extra_block}{indicator_block}- 使用者的持倉風控與紀律檢核（規則式計算，非AI生成，若顯示「未上傳交易紀錄」則代表
   這次沒有這份資料，不要臆測數字）：
 {portfolio_block}"""
@@ -2709,7 +2930,10 @@ RSI、MACD、KD這些名詞，請你完全用生活化的白話文解釋，禁�
 
 ## 3. 最近K線型態代表什麼
 如果上面有偵測到K線型態，請用白話解釋這個型態通常代表市場心理上發生了什麼事
-（例如十字星代表多空雙方勢均力敵，猶豫不決）；如果沒有偵測到型態，就直接說明
+（例如十字星代表多空雙方勢均力敵，猶豫不決）；如果上面有偵測到「較長期價格排列型態」
+（雙重頂/底、頭肩頂/底），也請用白話解釋這個排列通常代表什麼意思（例如雙重頂可以想像
+成「股價兩次想衝上同一個高度都失敗，上面像是有一層看不見的天花板」），並說明目前是
+「已經跌破/突破頸線」還是「還沒確認，只是觀察中」；如果都沒有偵測到型態，就直接說明
 「這幾天沒有出現特別值得注意的型態，屬於正常情況」，不要硬掰一個出來。
 
 ## 4. 持倉紀律白話提醒
@@ -2731,7 +2955,7 @@ RSI、MACD、KD這些名詞，請你完全用生活化的白話文解釋，禁�
 
 
 def build_us_beginner_prompt(symbol, stats, trend=None, patterns=None, quote=None,
-                              stop_plan=None, portfolio_check=None) -> str:
+                              stop_plan=None, portfolio_check=None, chart_patterns=None) -> str:
     """給完全新手看的美股白話版AI解說：把上面「Gemini AI 深度分析」已經算好的技術指標、
     停損停利規則、持倉風控數字，改用生活化的白話文重新講一次給沒學過技術分析的人聽，
     不重複貼出原始數字表格，語氣像在跟朋友聊天。"""
@@ -2755,6 +2979,8 @@ def build_us_beginner_prompt(symbol, stats, trend=None, patterns=None, quote=Non
 - 布林通道位置：{stats['bb_position']}
 - KD：K={_fmt_num(stats['latest_kd_k'], 1)}／D={_fmt_num(stats['latest_kd_d'], 1)}（{stats['kd_signal']}）
 - 最近K線型態：{_fmt_patterns(patterns)}
+- 較長期價格排列型態（雙重頂/底、頭肩頂/底）：
+{_fmt_chart_patterns(chart_patterns)}
 - 使用者自己的停損／停利機制（規則式算好的實際數字，不可自行發明其他百分比）：
 {stop_plan_block}
 - 使用者的持倉風控與紀律檢核（規則式計算，若顯示「未上傳交易紀錄」則代表這次沒有
@@ -2775,9 +3001,11 @@ def build_us_beginner_prompt(symbol, stats, trend=None, patterns=None, quote=Non
 用一般人聽得懂的方式，解釋目前是漲勢、跌勢還是盤整，簡單解釋「支撐」跟「壓力」分別
 是什麼（像地板跟天花板），再套用到目前的實際價位上。
 
-## 2. 技術指標白話講
+## 2. 技術指標與型態白話講
 挑重點用白話解釋 RSI／MACD／KD／均線目前偏多還是偏空（例如RSI超過70可以想像成
-「跑得有點喘，可能需要休息」），不用逐一複誦所有數字。
+「跑得有點喘，可能需要休息」），不用逐一複誦所有數字；如果上面有偵測到「較長期價格
+排列型態」（雙重頂/底、頭肩頂/底），也用白話解釋這代表什麼（例如雙重頂像是「股價兩次
+想衝上同一個高度都失敗」），並說明目前是已經突破/跌破頸線確認，還是還在觀察中。
 
 ## 3. 停損停利白話講
 把上面「使用者自己的停損／停利機制」的數字，用白話解釋現在股價距離每一條線大概還有
@@ -2820,6 +3048,8 @@ def run_taiwan_app():
             help="至 https://aistudio.google.com/apikey 免費註冊取得",
         )
         st.markdown("---")
+        portfolio_inputs = render_portfolio_inputs_sidebar()
+        st.markdown("---")
         st.caption("金鑰僅保存於本次瀏覽器 session 記憶體中，不會寫入檔案或上傳。")
 
     st.markdown(
@@ -2850,7 +3080,15 @@ def run_taiwan_app():
         )
         run = st.button("🔍 開始分析", type="primary", use_container_width=True, key="tw_run_button")
 
-    if not run:
+    if "tw_analyzed" not in st.session_state:
+        st.session_state["tw_analyzed"] = False
+    if run:
+        st.session_state["tw_analyzed"] = True
+
+    # 同樣用 session_state 記住「已經按過開始分析」，避免分析完成後在頁面上上傳交易紀錄
+    # CSV（或調整任何其他小工具）觸發 Streamlit 重新執行腳本時，因為按鈕這次沒被按、
+    # run 變回 False，就整頁「跳回」最前面尚未分析的畫面。
+    if not st.session_state["tw_analyzed"]:
         st.info("💡 輸入股票代號後按下「開始分析」即可，不需要輸入任何密碼或帳號。")
         return
 
@@ -2870,6 +3108,7 @@ def run_taiwan_app():
     df = add_indicators(df_raw)
     trend = detect_trend_pattern(df)
     patterns = detect_candlestick_patterns(df)
+    chart_patterns = detect_chart_patterns(df)
     quote = fetch_tw_realtime_quote(resolved_symbol)
 
     latest_close = float(df["close"].iloc[-1])
@@ -2959,12 +3198,22 @@ def run_taiwan_app():
         st.caption(f"目前價位落在近一年區間的 {stats52['position_pct']:.0f}% 位置"
                    "（0%接近最低點，100%接近最高點）")
     with tc2:
-        st.markdown("**最近5天K線型態**")
+        st.markdown("**近期K線型態**")
         if patterns:
             for d, name, meaning in patterns:
                 st.markdown(f"- **{d}｜{name}**：{meaning}")
         else:
-            st.caption("已檢查最近5天的K線，但沒有出現十字星/鎚子線/吞噬型態等明顯型態，這是正常情況。")
+            st.caption("已檢查最近的K線，但沒有出現十字星/鎚子線/吞噬型態等明顯型態，這是正常情況。")
+
+    st.markdown("**較長期價格排列型態（雙重頂/底、頭肩頂/底）**")
+    if chart_patterns:
+        for p in chart_patterns:
+            status = "✅ 已確認" if p["confirmed"] else "⏳ 尚未確認"
+            box = st.warning if p["bias"] == "偏空" else st.success
+            box(f"**{p['pattern']}**（{status}）\n\n{p['detail']}")
+    else:
+        st.caption("已掃描近期較長區間的轉折高低點，但沒有偵測到雙重頂/底或頭肩頂/底等型態，屬於正常情況。")
+    st.caption("以上型態辨識皆為規則式演算法，非影像辨識或專業技術分析軟體等級的完整判斷，僅供輔助參考。")
 
     if relative_strength:
         diff = relative_strength["diff"]
@@ -2977,7 +3226,7 @@ def run_taiwan_app():
         st.caption("「相對表現」是這支股票漲跌幅減掉大盤漲跌幅，數字越大代表比大盤強勢。")
 
     st.markdown("---")
-    portfolio_check = render_portfolio_discipline_section(symbol_input.strip().upper(), df)
+    portfolio_check = render_portfolio_discipline_section(symbol_input.strip().upper(), df, portfolio_inputs)
 
     st.markdown("---")
     st.markdown("##### 🤖 AI 白話解說")
@@ -2995,7 +3244,7 @@ def run_taiwan_app():
                     latest_date, trend, patterns, quote=quote,
                     stats52=stats52, relative_strength=relative_strength,
                     company_info=company_info, indicators=indicators,
-                    portfolio_check=portfolio_check,
+                    portfolio_check=portfolio_check, chart_patterns=chart_patterns,
                 )
                 explanation = call_gemini(prompt, gemini_key)
                 st.markdown(explanation)
