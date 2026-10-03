@@ -2230,11 +2230,16 @@ def build_markdown_report(symbol, stats, start_date, end_date, ai_analysis: str,
 
 
 # ----------------------------------------------------------------------------
-# 5.5 Perplexity 基本面研究＋估值＋買賣規則＋反方論點＋財報後更新
+# 5.5 Perplexity 基本面研究報告＋反方論點＋財報後更新
 #     （選用功能，需使用者自己的 Perplexity API 金鑰；美股／台股共用同一套函式與畫面。
-#      Perplexity 本身內建即時網路搜尋，用來查驗真實的財報數字、事件與反方論點來源；
-#      EPS×本益比、DCF 估值則用純 Python 公式計算，AI 只負責「解讀」已經查到的事實與
-#      算好的數字，延續整支工具一貫的「規則算數字、AI講解讀」設計原則，不讓AI自己編數字。）
+#      設計原則：使用者不需要自己輸入任何財務假設數字（EPS／本益比／成長率／折現率…），
+#      只要按一個按鈕，由 Perplexity 自己上網查資料、自己抓估值假設、自己算、自己寫成一份
+#      完整報告——格式與深度比照專業研究報告（公司論點、財務數字、現金流、多種估值法、
+#      情境估值、籌碼技術面、分批建議、最終結論），並盡量附上真實來源；
+#      所有主觀假設（例如DCF的成長率/折現率）AI都要清楚標註「這是估算情境」，不能假裝是
+#      公司公布的數字。這跟本工具其他技術面功能「規則算數字、AI講解讀」的原則不同——因為
+#      使用者明確希望不要再填一堆輸入框，所以這個子功能改由AI全權負責查資料＋算數字＋寫結論，
+#      使用者只需要審閱、不需要自己動手輸入假設值。）
 # ----------------------------------------------------------------------------
 
 PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
@@ -2256,7 +2261,7 @@ def call_perplexity(api_key: str, prompt: str, model: str = "sonar-pro"):
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.2,
             },
-            timeout=90,
+            timeout=120,
         )
         if resp.status_code != 200:
             try:
@@ -2279,144 +2284,76 @@ def call_perplexity(api_key: str, prompt: str, model: str = "sonar-pro"):
         return "", [], f"Perplexity 查詢發生錯誤：{exc}"
 
 
-def build_perplexity_fact_check_prompt(symbol: str, company_name: str, market: str) -> str:
-    """①查驗數字與事件：財報、月營收（台股）/季報指引（美股）、法人預估、法說會與重大訊息。"""
+def build_perplexity_full_report_prompt(symbol: str, company_name: str, market: str,
+                                         current_price=None, technical_context: str = None,
+                                         portfolio_context: str = None) -> str:
+    """一鍵完整基本面研究報告：查數字＋估值（含DCF等情境估值，AI自己抓假設）＋籌碼技術面＋
+    買賣決策規則＋最終結論，全部一次生成，使用者不需要自己輸入任何財務假設。"""
     today = datetime.now().date().isoformat()
-    revenue_line = ("每月營收公告的最新趨勢（與去年同期、上月比較）" if market == "TW"
-                    else "最近一次財報發布的營收與每股盈餘（EPS）是否優於／符合／低於市場預期")
-    return f"""你是一位嚴謹、只根據可查證公開資訊作答的證券研究員，今天是 {today}。
-請針對「{company_name}」（代號：{symbol}）查驗以下五類最新數字與事件，盡量引用近1~3個月內的
-可靠來源與日期：
+    price_line = (f"目前參考股價約 {current_price:.2f}（以此對照你算出的估值區間）"
+                  if current_price else "（本次未提供目前股價，請你自行查詢最新股價再進行估值比較）")
+    revenue_note = ("台股請特別留意每月營收公告的最新趨勢" if market == "TW"
+                    else "美股請留意最近一次財報與公司財測指引")
+    portfolio_block = (
+        "以下是使用者目前持倉與風控現況，請據此給出具體的加碼／減碼／停利／停損建議：\n"
+        + portfolio_context
+    ) if portfolio_context else "使用者尚未提供持倉資料，請分別給「尚未持有」與「已持有」兩種情境各自的分批進出場建議框架。"
 
-1. 最新一期財報重點：營收、毛利率、營業利益率、EPS，是否優於／符合／低於市場預期
-2. {revenue_line}
-3. 目前分析師／法人機構對下一期（或下一年度）EPS、營收的平均預估值（consensus），
-   以及近期預估是否被上調或下調
-4. 近期法說會（earnings call／法人說明會）中，管理層揭露的關鍵營運訊號
-   （新產品、訂單、庫存、產能、競爭狀況、原物料或供應鏈風險等）
-5. 近期是否有重大訊息公告（併購、增減資、庫藏股、高層異動、訴訟、調降財測等）
+    return f"""你是一位會自己動手查資料、算數字、給結論的證券研究員，請針對「{company_name}」
+（代號：{symbol}）撰寫一份完整的基本面研究報告。請用繁體中文撰寫，格式與深度請比照專業的
+賣方研究報告（可以大量使用表格），盡量引用近期（1~3個月內）真實公開資料，重要數字後請標註
+來源或至少說明資料時間。今天是 {today}。{price_line}。{revenue_note}。
 
-請用條列方式呈現，每一點盡量標註資料時間與來源名稱；如果某一項查無可靠的最新公開資料，
-請直接說明「查無最新資料」，絕對不要編造或臆測未公開的數字。"""
+請按照以下架構撰寫，各節請用「##」做標題，可視實際查到的資料調整細節，但大方向不要省略：
 
+1. 開頭先用一段話給出結論：這家公司值不值得追蹤／現在的價格算貴還是便宜／適合一次買進
+   還是分批布局。
+2. ## 公司與投資論點：核心業務、競爭優勢、目前的主要成長動能是什麼。
+3. ## 最新財務數字：近1-2期營收、營收年增率、毛利率、營業利益率、EPS，做成表格，並判讀
+   是否優於／符合／低於市場預期。
+4. ## 現金流與獲利品質：本業獲利是否紮實（而非一次性業外收益）、資本支出狀況、
+   未來自由現金流的風險與機會。
+5. ## 估值檢驗：請至少用「前瞻本益比」「歷史本益比所在分位」「簡化DCF」「殖利率」這幾種
+   方法交叉檢驗目前股價是貴、合理、還是便宜。DCF請你自己抓保守／中性／樂觀三種情境的
+   EPS、成長率、折現率、終值成長率假設，清楚標註「這是估算情境，非公司公布數字」，並用
+   表格列出假設與算出的每股價值。每種估值法都請用表格呈現。
+6. ## 情境估值與觸發條件：給出保守／中性／樂觀三種情境的合理價格區間，以及要看到哪些具體
+   訊號（例如毛利率變化、營收年增率、法人預估調整）才會觸發情境轉換，用表格呈現。
+7. ## 籌碼與技術面：請查詢近期法人（外資／投信／自營商，或美股的機構持股／內部人交易）
+   買賣超動向，並對照以下已經算好的技術面現況（請直接引用，不用重算）：
+{technical_context or '（本次未提供技術面資料）'}
+8. ## 持倉與分批建議：{portfolio_block}
+9. ## 最終判斷：用2-3句話總結目前比較適合「重壓買進」「分批布局」還是「觀望等待」，
+   並簡短說明理由。
 
-def calc_eps_pe_valuation(eps_bear: float, eps_base: float, eps_bull: float,
-                           pe_bear: float, pe_base: float, pe_bull: float,
-                           current_price: float = None) -> dict:
-    """②判斷價格是否合理（方法一：EPS × 本益比情境估值）。純數字計算，不經過AI。"""
-    scenarios = {
-        "空頭情境": eps_bear * pe_bear,
-        "基準情境": eps_base * pe_base,
-        "多頭情境": eps_bull * pe_bull,
-    }
-    upside = None
-    if current_price and current_price > 0:
-        upside = {k: (v / current_price - 1) * 100 for k, v in scenarios.items()}
-    return {"scenarios": scenarios, "upside_pct": upside, "current_price": current_price}
-
-
-def calc_dcf_valuation(fcf0: float, growth_bear: float, growth_base: float, growth_bull: float,
-                        discount_rate: float, terminal_growth: float, years: int,
-                        shares_outstanding: float, net_cash: float = 0.0) -> dict:
-    """②判斷價格是否合理（方法二：簡化版 DCF，三種成長率情境）。
-    fcf0：目前一年的自由現金流；net_cash：淨現金（可為負，代表淨負債）；
-    shares_outstanding：流通股數（須跟 fcf0、net_cash 用同一種貨幣單位）。
-    discount_rate 必須大於 terminal_growth，否則終值會發散，回傳 {"error": ...} 說明原因。
-    """
-    if discount_rate <= terminal_growth:
-        return {"error": "折現率必須大於永續成長率，否則終值計算會發散，請調整假設值。"}
-
-    def _dcf(growth):
-        fcf = fcf0
-        pv_sum = 0.0
-        for t in range(1, years + 1):
-            fcf = fcf * (1 + growth)
-            pv_sum += fcf / ((1 + discount_rate) ** t)
-        terminal_value = (fcf * (1 + terminal_growth)) / (discount_rate - terminal_growth)
-        pv_terminal = terminal_value / ((1 + discount_rate) ** years)
-        equity_value = pv_sum + pv_terminal + net_cash
-        return equity_value / shares_outstanding if shares_outstanding else None
-
-    return {
-        "scenarios": {
-            "空頭情境": _dcf(growth_bear),
-            "基準情境": _dcf(growth_base),
-            "多頭情境": _dcf(growth_bull),
-        }
-    }
-
-
-def _fmt_valuation_block(eps_pe_result: dict, dcf_result: dict) -> str:
-    """把估值計算結果整理成文字區塊，餵給 AI 當輸入、也可用於下載報告。"""
-    lines = []
-    if eps_pe_result:
-        lines.append("【EPS × 本益比情境估值】")
-        for k, v in eps_pe_result["scenarios"].items():
-            up = eps_pe_result.get("upside_pct")
-            up_str = f"（距目前股價 {up[k]:+.1f}%）" if up else ""
-            lines.append(f"- {k}：約 {v:,.2f}{up_str}")
-    if dcf_result:
-        if dcf_result.get("error"):
-            lines.append(f"【DCF 估值】計算失敗：{dcf_result['error']}")
-        else:
-            lines.append("【DCF 每股內含價值情境估值】")
-            for k, v in dcf_result["scenarios"].items():
-                v_str = f"約 {v:,.2f}" if v is not None else "N/A"
-                lines.append(f"- {k}：{v_str}")
-    return "\n".join(lines) if lines else "（尚未計算估值）"
-
-
-def build_trading_rules_prompt(symbol: str, fundamentals_summary: str, valuation_text: str,
-                                technical_context: str, portfolio_context: str) -> str:
-    """③決定買賣規則：把基本面＋估值＋技術面＋籌碼/風險轉成具體可執行的IF-THEN條件。"""
-    return f"""你是一位同時考慮基本面、估值、技術面、籌碼面（持倉）與風險控管的交易策略顧問。
-請針對 {symbol}，根據以下四組資訊，訂出「具體、可執行」的買賣規則——用 IF...THEN 條件句列出，
-不要只給「觀察」「視情況而定」這類沒有明確判斷依據的方向性建議：
-
----① 基本面查核結果（Perplexity）---
-{fundamentals_summary or '（尚未查核，略過此項）'}
-
----② 估值結果（規則式計算）---
-{valuation_text or '（尚未計算，略過此項）'}
-
----③ 技術面與型態現況---
-{technical_context or '（無）'}
-
----④ 持倉與風控現況---
-{portfolio_context or '（無，使用者未上傳交易紀錄）'}
-
-請輸出四類規則，每一條都要講出具體數字或可驗證的判斷依據：
-1. 「加碼」條件：需要同時滿足哪些基本面＋估值＋技術面條件
-2. 「減碼／停利」條件
-3. 「停損／退出」條件
-4. 「觀察、暫不動作」條件
-
-最後提醒使用者：以上規則只是根據現有資料整理出的參考框架，不是投資建議，實際買賣決策與
-風險由使用者自行承擔。"""
+請全程保持查核心態：查無可靠資料的地方要明講「查無最新資料」，不要編造數字；報告最後請加上
+一句提醒——以上內容為根據公開資訊整理與估算的參考內容，不構成投資建議，投資風險由使用者
+自行承擔。"""
 
 
 def build_perplexity_bear_case_prompt(symbol: str, company_name: str, bull_summary: str) -> str:
-    """④找反方論點：Perplexity 用即時網路搜尋，刻意扮演空方，找真實存在的反對證據，
-    用來檢驗另一個分析（買賣規則／基本面查核結果）背後偏多的假設是否過於樂觀。"""
+    """找反方論點：Perplexity 用即時網路搜尋，刻意扮演空方，找真實存在的反對證據，
+    用來檢驗上面完整報告背後偏多的假設是否過於樂觀。"""
     return f"""你現在要扮演「空方研究員」，任務是刻意找出「{company_name}」（{symbol}）股價可能被
-高估、或基本面轉弱的理由，藉此檢驗以下這組偏多（樂觀）分析背後的假設是否站得住腳：
+高估、或基本面轉弱的理由，藉此檢驗以下這份分析報告背後的假設是否站得住腳：
 
----待檢驗的多方分析摘要---
+---待檢驗的分析報告---
 {bull_summary}
 ---
 
 請搜尋近期（過去1~3個月內）真實存在的資料，條列出：
-1. 可能挑戰上述樂觀假設的具體數字或事件（例如：分析師下調目標價或評等、放空／融券比例上升、
-   庫存或應收帳款異常增加、毛利率下滑、競爭對手搶市佔、法規或供應鏈風險、客戶集中度風險等）
+1. 可能挑戰上述報告中樂觀假設的具體數字或事件（例如：分析師下調目標價或評等、放空／融券比例
+   上升、庫存或應收帳款異常增加、毛利率下滑、競爭對手搶市佔、法規或供應鏈風險、客戶集中度
+   風險等）
 2. 若有知名機構、分析師或財經媒體發表看空／保守的報告或評論，請引用來源名稱與日期
-3. 最後用1~2句話總結：以目前查得到的資料來看，上述多方假設中最脆弱的一環是什麼
+3. 最後用1~2句話總結：以目前查得到的資料來看，上述報告中最脆弱的一環是什麼
 
 請務必基於可查證的真實資訊作答；查無相關資料就明確說「查無可靠的反方資料」，不要自行編造
 數字或事件來硬湊空方論點。"""
 
 
 def build_perplexity_earnings_update_prompt(symbol: str, company_name: str, original_thesis: str) -> str:
-    """⑤財報後更新：拿最新查到的數字跟使用者原始投資論點比對，判斷加碼/持有/減碼/退出。"""
+    """財報後更新：拿最新查到的數字跟使用者原始投資論點比對，判斷加碼/持有/減碼/退出。"""
     today = datetime.now().date().isoformat()
     return f"""今天是 {today}。使用者對「{company_name}」（{symbol}）原始的投資論點如下：
 
@@ -2438,24 +2375,21 @@ def build_perplexity_earnings_update_prompt(symbol: str, company_name: str, orig
 def render_perplexity_section(symbol: str, market: str, perplexity_key: str,
                                current_price, trend: dict, patterns: list,
                                chart_patterns: list, portfolio_check: dict,
-                               gemini_key: str, gemini_model: str = "gemini-3.5-flash-lite",
                                company_name: str = None):
-    """新增：Perplexity 基本面研究＋估值＋買賣規則＋反方論點＋財報後更新，共五個子功能，
-    美股／台股共用同一套畫面與函式。全部都是選填功能：沒有填 Perplexity 金鑰時只顯示
-    提示文字，完全不影響上面原本的技術面分析／白話AI解說。
+    """Perplexity 基本面研究報告＋反方論點＋財報後更新，三個子功能都只要按按鈕，
+    不需要使用者自己輸入任何財務假設數字。美股／台股共用同一套畫面與函式。
+    全部都是選填功能：沒有填 Perplexity 金鑰時只顯示提示文字，完全不影響上面原本的
+    技術面分析／白話AI解說。
 
     每個子功能的結果都存進 st.session_state（用 market+symbol 當 key 的一部分），
-    避免跟其他按鈕一樣遇到「按下其他小工具就整頁跳回」的問題——沿用本工具一路以來對
-    Streamlit rerun 機制的修法：結果不是看按鈕這次是否為 True，而是看 session_state
-    裡有沒有存過結果。
+    沿用本工具一路以來對 Streamlit rerun 機制的修法：結果不是看按鈕這次是否為 True，
+    而是看 session_state 裡有沒有存過結果，避免跟其他小工具互動時整頁跳回。
     """
     company_name = company_name or symbol
-    st.header("🧭 基本面研究與估值（Perplexity，選用功能）")
+    st.header("🧭 基本面研究報告（Perplexity，選用功能）")
     st.caption(
-        "以下五個子功能需要你自己申請的 Perplexity API 金鑰（至 "
-        "https://www.perplexity.ai/settings/api 申請，具備即時網路搜尋能力，用來查驗真實的"
-        "財報數字、事件與反方論點來源）。跟上面其他 AI 分析一樣：估值數字（EPS×本益比、DCF）"
-        "都是用純數學公式計算，AI 只負責解讀查到的事實與算好的數字，不會自己編造。"
+        "按一下按鈕，AI 會自動上網查資料、算估值、給結論，不需要你自己輸入任何財務假設數字。"
+        "需要先在側邊欄輸入 Perplexity API 金鑰（至 https://www.perplexity.ai/settings/api 申請）。"
     )
 
     technical_context = (
@@ -2466,135 +2400,52 @@ def render_perplexity_section(symbol: str, market: str, perplexity_key: str,
     )
     portfolio_context = _fmt_portfolio_check_lines(portfolio_check) if portfolio_check else None
 
-    fundamentals_summary = None
-    valuation_text = None
-
-    # --- ① 查驗數字與事件 ---
-    st.markdown("##### 1️⃣ 查驗數字與事件（財報／營收／法人預估／法說與重大訊息）")
-    fc_key = f"pplx_fact_check_{market}_{symbol}"
-    if st.button("🔎 查核最新財報與事件", key=f"btn_fact_check_{market}"):
-        with st.spinner("Perplexity 正在搜尋最新財報、營收、法人預估與重大訊息..."):
+    # --- 完整基本面研究報告（一鍵生成） ---
+    report_key = f"pplx_full_report_{market}_{symbol}"
+    if st.button("🔍 產生完整基本面研究報告", key=f"btn_full_report_{market}", type="primary"):
+        with st.spinner("Perplexity 正在查資料、算估值、撰寫報告，可能需要30秒~1分鐘，請稍候..."):
             content, citations, err = call_perplexity(
-                perplexity_key, build_perplexity_fact_check_prompt(symbol, company_name, market)
+                perplexity_key,
+                build_perplexity_full_report_prompt(
+                    symbol, company_name, market, current_price=current_price,
+                    technical_context=technical_context, portfolio_context=portfolio_context,
+                ),
             )
         if err:
             st.warning(err)
         else:
-            st.session_state[fc_key] = {"content": content, "citations": citations}
+            st.session_state[report_key] = {"content": content, "citations": citations}
 
-    if fc_key in st.session_state:
-        st.markdown(st.session_state[fc_key]["content"])
-        cites = st.session_state[fc_key]["citations"]
+    report_content = None
+    if report_key in st.session_state:
+        report_content = st.session_state[report_key]["content"]
+        st.markdown(report_content)
+        cites = st.session_state[report_key]["citations"]
         if cites:
             with st.expander(f"📎 參考來源（{len(cites)}）"):
                 for i, c in enumerate(cites, 1):
                     st.markdown(f"{i}. {c}")
-        fundamentals_summary = st.session_state[fc_key]["content"]
+        st.download_button(
+            "📥 下載基本面研究報告（Markdown）",
+            data=report_content.encode("utf-8"),
+            file_name=f"{symbol}_基本面研究報告.md",
+            mime="text/markdown",
+            key=f"dl_report_{market}_{symbol}",
+        )
     else:
-        st.caption("按上面的按鈕，讓 Perplexity 用即時網路搜尋查核最新財報、營收、法人預估、"
-                   "法說會重點與重大訊息（需要先在側邊欄輸入 Perplexity 金鑰）。")
+        st.caption("按上面的按鈕即可，不需要先填任何估值假設或財務數字。")
 
     st.markdown("---")
 
-    # --- ② 判斷價格是否合理：EPS×PE + DCF ---
-    st.markdown("##### 2️⃣ 判斷價格是否合理（EPS × 本益比、DCF 情境估值）")
-    with st.expander("📐 輸入估值假設值（空頭／基準／多頭三種情境）", expanded=False):
-        st.caption("建議參考上面①查到的法人預估EPS，或自行研究後填入；本工具只負責計算，"
-                   "不會幫你猜測或編造財報數字。")
-        pe_col1, pe_col2 = st.columns(2)
-        with pe_col1:
-            st.markdown("**EPS 預估（下一年度）**")
-            eps_bear = st.number_input("空頭情境 EPS", value=0.0, step=0.1, key=f"eps_bear_{market}")
-            eps_base = st.number_input("基準情境 EPS", value=0.0, step=0.1, key=f"eps_base_{market}")
-            eps_bull = st.number_input("多頭情境 EPS", value=0.0, step=0.1, key=f"eps_bull_{market}")
-        with pe_col2:
-            st.markdown("**本益比假設**")
-            pe_bear = st.number_input("空頭情境 PE", value=0.0, step=1.0, key=f"pe_bear_{market}")
-            pe_base = st.number_input("基準情境 PE", value=0.0, step=1.0, key=f"pe_base_{market}")
-            pe_bull = st.number_input("多頭情境 PE", value=0.0, step=1.0, key=f"pe_bull_{market}")
-
-        st.markdown("**DCF 假設（選填，留空或填0則不計算DCF）**")
-        dc1, dc2, dc3 = st.columns(3)
-        with dc1:
-            fcf0 = st.number_input("目前一年自由現金流（FCF）", value=0.0, step=1000.0, key=f"fcf0_{market}")
-            shares_outstanding = st.number_input("流通股數", value=0.0, step=1000.0, key=f"shares_{market}")
-        with dc2:
-            growth_bear = st.number_input("空頭情境成長率(%)", value=0.0, step=1.0, key=f"g_bear_{market}") / 100
-            growth_base = st.number_input("基準情境成長率(%)", value=0.0, step=1.0, key=f"g_base_{market}") / 100
-            growth_bull = st.number_input("多頭情境成長率(%)", value=0.0, step=1.0, key=f"g_bull_{market}") / 100
-        with dc3:
-            discount_rate = st.number_input("折現率(%)", value=10.0, step=0.5, key=f"disc_{market}") / 100
-            terminal_growth = st.number_input("永續成長率(%)", value=2.0, step=0.5, key=f"term_{market}") / 100
-            net_cash = st.number_input("淨現金（負值代表淨負債）", value=0.0, step=1000.0, key=f"netcash_{market}")
-
-        calc = st.button("📊 計算估值", key=f"btn_calc_valuation_{market}")
-
-    if calc:
-        eps_pe_result = None
-        if eps_base and pe_base:
-            eps_pe_result = calc_eps_pe_valuation(eps_bear, eps_base, eps_bull, pe_bear, pe_base, pe_bull,
-                                                    current_price=current_price)
-        dcf_result = None
-        if fcf0 and shares_outstanding and discount_rate:
-            dcf_result = calc_dcf_valuation(fcf0, growth_bear, growth_base, growth_bull,
-                                             discount_rate, terminal_growth, years=5,
-                                             shares_outstanding=shares_outstanding, net_cash=net_cash)
-        if eps_pe_result or dcf_result:
-            st.session_state[f"valuation_result_{market}_{symbol}"] = (eps_pe_result, dcf_result)
-        else:
-            st.warning("請至少填好「基準情境 EPS＋PE」或「DCF 假設」其中一組，才能計算估值。")
-
-    val_key = f"valuation_result_{market}_{symbol}"
-    if val_key in st.session_state:
-        eps_pe_result, dcf_result = st.session_state[val_key]
-        valuation_text = _fmt_valuation_block(eps_pe_result, dcf_result)
-        st.markdown(valuation_text.replace("\n", "  \n"))
-    else:
-        st.caption("展開上面「輸入估值假設值」填好假設值後按「計算估值」，會用 EPS×本益比與簡化版"
-                   "DCF公式算出三種情境的合理價格（純數學計算，不呼叫AI）。")
-
-    st.markdown("---")
-
-    # --- ③ 決定買賣規則 ---
-    st.markdown("##### 3️⃣ 決定買賣規則（把基本面＋估值＋技術面＋籌碼/風險轉成條件）")
-    if not gemini_key:
-        st.warning("請先在側邊欄輸入 Gemini API 金鑰，才能生成買賣規則。")
-    elif st.button("📐 生成買賣規則", key=f"btn_trading_rules_{market}"):
-        with st.spinner("AI 正在整合基本面、估值、技術面與持倉風控資料，生成買賣規則..."):
-            try:
-                rules_prompt = build_trading_rules_prompt(
-                    symbol, fundamentals_summary, valuation_text, technical_context, portfolio_context
-                )
-                rules = call_gemini(rules_prompt, gemini_key, gemini_model)
-                st.session_state[f"trading_rules_{market}_{symbol}"] = rules
-            except Exception as exc:
-                st.error(f"買賣規則生成失敗：{exc}")
-
-    rules_key = f"trading_rules_{market}_{symbol}"
-    bull_summary_for_bear_case = None
-    if rules_key in st.session_state:
-        st.markdown(st.session_state[rules_key])
-        bull_summary_for_bear_case = st.session_state[rules_key]
-    else:
-        st.caption("按上面的按鈕，AI 會整合①基本面查核、②估值結果、現有技術面與持倉風控資料，"
-                   "生成具體的加碼／減碼／停損／觀察規則（①②沒有資料時會自動略過該項）。")
-
-    st.markdown("---")
-
-    # --- ④ 找反方論點 ---
-    st.markdown("##### 4️⃣ 找反方論點（讓 Perplexity 扮演空方，檢驗樂觀假設）")
-    bull_input_default = bull_summary_for_bear_case or fundamentals_summary or ""
-    bull_input = st.text_area(
-        "要被檢驗的「多方／樂觀」分析摘要（預設帶入③的買賣規則或①的查核結果，可自行修改或貼上別的分析）",
-        value=bull_input_default, height=100, key=f"bear_case_input_{market}",
-    )
+    # --- 找反方論點（自動用上面的報告當輸入，不需要再手動貼一次） ---
+    st.markdown("##### 🐻 找反方論點（讓 Perplexity 扮演空方，檢驗上面報告的樂觀假設）")
     if st.button("🐻 找反方論點", key=f"btn_bear_case_{market}"):
-        if not bull_input.strip():
-            st.warning("請先完成①或③，或自行貼上一段多方分析摘要，才能檢驗。")
+        if not report_content:
+            st.warning("請先產生上面的「完整基本面研究報告」，才能檢驗其中的樂觀假設。")
         else:
             with st.spinner("Perplexity 正在搜尋真實存在的空方論點與風險..."):
                 content, citations, err = call_perplexity(
-                    perplexity_key, build_perplexity_bear_case_prompt(symbol, company_name, bull_input)
+                    perplexity_key, build_perplexity_bear_case_prompt(symbol, company_name, report_content)
                 )
             if err:
                 st.warning(err)
@@ -2610,18 +2461,18 @@ def render_perplexity_section(symbol: str, market: str, perplexity_key: str,
                 for i, c in enumerate(cites, 1):
                     st.markdown(f"{i}. {c}")
     else:
-        st.caption("按上面的按鈕，Perplexity 會刻意扮演空方，搜尋真實的分析師下調、空單變化、"
-                   "風險因子等資料，用來檢驗上面偏多分析的假設是否過於樂觀。")
+        st.caption("按上面的按鈕，Perplexity 會刻意扮演空方，針對上面報告中偏多的假設，"
+                   "搜尋真實存在的反對證據。需要先產生上面的完整報告。")
 
     st.markdown("---")
 
-    # --- ⑤ 財報後更新 ---
-    st.markdown("##### 5️⃣ 財報後更新（比較新數字與原始投資論點）")
+    # --- 財報後更新（這一項無法避免手動輸入，因為需要使用者自己原本的論點才能比對） ---
+    st.markdown("##### 🔄 財報後更新（比較新數字與你原本的投資論點）")
     thesis_key = f"original_thesis_{market}_{symbol}"
     original_thesis = st.text_area(
-        "寫下（或貼上）你原本對這支股票的投資論點（例如：看好的理由、假設的成長率、目標價等），"
-        "下次財報公布後回來這裡，按下方按鈕讓 AI 幫你比對新數字是否驗證或推翻這些假設",
-        value=st.session_state.get(thesis_key, ""), height=100, key=f"thesis_input_{market}",
+        "寫下你原本對這支股票的投資論點（例如看好的理由、假設的成長率、目標價等），"
+        "財報公布後回來這裡按下方按鈕，讓 AI 幫你比對新數字是否驗證或推翻這些假設",
+        value=st.session_state.get(thesis_key, ""), height=80, key=f"thesis_input_{market}_{symbol}",
     )
     if original_thesis != st.session_state.get(thesis_key, ""):
         st.session_state[thesis_key] = original_thesis
@@ -2649,13 +2500,13 @@ def render_perplexity_section(symbol: str, market: str, perplexity_key: str,
                 for i, c in enumerate(cites, 1):
                     st.markdown(f"{i}. {c}")
     else:
-        st.caption("寫好原始投資論點後，財報公布後回來按下方按鈕，AI 會查最新數字並判斷"
-                   "目前比較適合加碼、持有、減碼或退出。")
+        st.caption("寫好原始投資論點後，財報公布後回來按下方按鈕比對（這一項需要你自己先寫下"
+                   "原本的想法，之後才有東西可以比對，無法由AI代勞）。")
 
-    st.caption("📢 以上基本面研究、估值、買賣規則、反方論點與財報後更新，皆為根據查得到的公開資訊"
-               "整理與計算的參考內容，不構成投資建議，資料正確性請自行查核，投資風險請自行承擔。")
+    st.caption("📢 以上基本面研究報告、反方論點與財報後更新，皆為AI根據查得到的公開資訊整理與"
+               "估算的參考內容，不構成投資建議，資料正確性請自行查核，投資風險請自行承擔。")
 
-    return fundamentals_summary
+    return report_content
 
 
 def _secret_default(key: str) -> str:
@@ -2888,7 +2739,7 @@ def run_us_app():
         symbol, "US", perplexity_key,
         current_price=stats.get("latest_close"),
         trend=trend, patterns=patterns, chart_patterns=chart_patterns,
-        portfolio_check=portfolio_check, gemini_key=gemini_key, gemini_model=gemini_model,
+        portfolio_check=portfolio_check,
     )
 
     st.markdown("---")
@@ -3705,7 +3556,7 @@ def run_taiwan_app():
         symbol_input.strip().upper(), "TW", perplexity_key,
         current_price=latest_close,
         trend=trend, patterns=patterns, chart_patterns=chart_patterns,
-        portfolio_check=portfolio_check, gemini_key=gemini_key,
+        portfolio_check=portfolio_check,
     )
 
     st.markdown("---")
