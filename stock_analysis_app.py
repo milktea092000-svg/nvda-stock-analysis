@@ -5,7 +5,8 @@
 =================================================
 
 首頁可以選擇要分析「美股」還是「台股」，兩種市場各自獨立運作，共用同一組
-Gemini API 金鑰（美股另外還需要 FMP／可選 Alpha Vantage 金鑰）：
+Gemini API 金鑰（美股另外還需要 FMP 金鑰；兩種市場都可選填 Perplexity 金鑰以使用
+「基本面研究報告」功能）：
 
 【美股模式】以「單一美股個股」為分析對象（輸入一個股票代號即可分析）：
     1. 向 Financial Modeling Prep (FMP) 取得該股票的歷史股價資料
@@ -19,10 +20,8 @@ Gemini API 金鑰（美股另外還需要 FMP／可選 Alpha Vantage 金鑰）�
     7. 視覺化：技術指標圖（均線/布林/KD/RSI/MACD/OBV）、訊號回測圖
     8. 規則式投資建議與風險評估（不需呼叫AI即可看到）
     9. 將整理後的數據交給 Google Gemini，產生具體、可執行的深度分析建議
-    10. 新聞情緒分析：向 Alpha Vantage NEWS_SENTIMENT API 取得該股票的最新新聞與情緒評分，
-        計算情緒分布、來源分布、主題分析，並交給 Gemini 產生市場情緒總結與深度分析
-    11. CNN Business「恐懼與貪婪指數（Fear & Greed Index）」：顯示目前整體美股市場情緒
-        （此功能串接的是非官方資料端點，並非 CNN 官方公開 API，可能隨時失效，詳見程式內說明）
+    10. 基本面研究報告（選填 Perplexity 金鑰）：一鍵生成包含估值、籌碼技術面、
+        分批建議的完整報告，並附反方論點與財報後更新比對功能
 
 安裝套件：
     pip install streamlit pandas numpy requests plotly
@@ -34,7 +33,7 @@ Gemini API 金鑰（美股另外還需要 FMP／可選 Alpha Vantage 金鑰）�
 執行後瀏覽器會開啟一個網頁，畫面上有欄位可以自行輸入：
     - FMP API 金鑰 (https://site.financialmodelingprep.com/ 註冊取得)
     - Gemini API 金鑰 (https://aistudio.google.com/apikey 註冊取得)
-    - Alpha Vantage API 金鑰（選用，新聞情緒分析用；https://www.alphavantage.co/support/#api-key 免費申請）
+    - Perplexity API 金鑰（選用，基本面研究報告用；https://www.perplexity.ai/settings/api 申請）
     - 欲分析的股票代號
 
 API 金鑰只會保存在你本機瀏覽器開啟的這個 session 記憶體中，不會被寫入檔案或上傳。
@@ -79,11 +78,6 @@ FMP_V3_URL_TMPL = "https://financialmodelingprep.com/api/v3/historical-price-ful
 FMP_QUOTE_STABLE_URL = "https://financialmodelingprep.com/stable/quote"
 FMP_QUOTE_V3_URL_TMPL = "https://financialmodelingprep.com/api/v3/quote/{symbol}"
 GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query"
-
-# CNN Business「恐懼與貪婪指數」沒有官方公開 API；這是外界長期觀察到、CNN 網站前端
-# 自己在用的一個「未正式紀錄」資料端點，並非官方合約保證的介面，隨時可能改版或封鎖。
-FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 
 TRADING_DAYS_PER_YEAR = 252
 RISK_FREE_RATE = 0.0  # Sharpe Ratio 固定以 0% 無風險利率計算（即年化報酬／年化波動度）
@@ -120,41 +114,6 @@ PYRAMID_A_MA_TOLERANCE_PCT = 0.03         # A. 「回測20MA或50MA止穩」的�
 PYRAMID_B_VOLUME_MULTIPLE = 1.5           # B. 突破確認買點：成交量須高於20日均量的1.5倍
 PYRAMID_B_LOOKBACK_WIN = 20               # B. 「前高壓力帶」用近幾日高點判斷
 ANTI_FOMO_WINDOW_DAYS = 3                 # 反FOMO回補檢查：賣出後幾個自然日內的買回都列入檢查
-
-# 新聞情緒五級分類配色（Bearish=深紅 ～ Bullish=深綠，符合金融情緒分析慣例配色）
-SENTIMENT_LABELS_ORDER = ["Bearish", "Somewhat-Bearish", "Neutral", "Somewhat-Bullish", "Bullish"]
-SENTIMENT_COLORS = {
-    "Bearish": "#DC143C",
-    "Somewhat-Bearish": "#FF6B6B",
-    "Neutral": "#95A5A6",
-    "Somewhat-Bullish": "#90EE90",
-    "Bullish": "#2ECC71",
-}
-
-# 情緒標籤對應表情符號：Bullish=笑臉／Bearish=哭臉／Neutral=不哭不笑；
-# Somewhat-Bullish/Bearish 用較淺的表情銜接兩端，方便一眼辨識情緒強弱。
-SENTIMENT_EMOJI = {
-    "Bearish": "😢",
-    "Somewhat-Bearish": "🙁",
-    "Neutral": "😐",
-    "Somewhat-Bullish": "🙂",
-    "Bullish": "😊",
-}
-
-
-def _sentiment_label_emoji(label: str) -> str:
-    """在情緒標籤前加上對應表情符號；非五級標準標籤（例如 N/A）則原樣傳回，不加表情。"""
-    emoji = SENTIMENT_EMOJI.get(label)
-    return f"{emoji} {label}" if emoji else label
-
-
-FEAR_GREED_RATING_ZH = {
-    "extreme fear": "極度恐懼",
-    "fear": "恐懼",
-    "neutral": "中性",
-    "greed": "貪婪",
-    "extreme greed": "極度貪婪",
-}
 
 
 # ----------------------------------------------------------------------------
@@ -271,155 +230,6 @@ def fetch_fmp_quote(symbol: str, api_key: str) -> dict:
         "volume": data.get("volume"),
         "avg_volume": data.get("avgVolume"),
         "updated_at": updated_at,
-    }
-
-
-# ----------------------------------------------------------------------------
-# 1b. 資料抓取：Alpha Vantage 新聞情緒 + CNN Business Fear & Greed Index
-# ----------------------------------------------------------------------------
-
-def _safe_float(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
-
-def fetch_alpha_vantage_news(symbol: str, api_key: str, limit: int = 50) -> list:
-    """向 Alpha Vantage NEWS_SENTIMENT API 取得指定股票的最新新聞與情緒資料。
-
-    回傳整理後的新聞清單（list of dict），每筆包含標題、連結、發布時間、來源、摘要、
-    整篇文章情緒分數／標籤，以及該篇文章「針對此股票」的相關性分數與情緒分數／標籤
-    （從 API 回傳的 ticker_sentiment 陣列中，篩出符合此股票代號的那一筆）。
-
-    Alpha Vantage 免費版帳號每日限 25 次 API 請求，超過額度或金鑰錯誤時，API 會用
-    HTTP 200 回傳一段包含 "Note" 或 "Information" 的錯誤說明文字，因此這裡會額外
-    檢查這兩個欄位並轉成明確的例外，而不是誤判成「沒有新聞」。
-    """
-    symbol = symbol.strip().upper()
-    resp = requests.get(
-        ALPHA_VANTAGE_URL,
-        params={"function": "NEWS_SENTIMENT", "tickers": symbol, "limit": limit, "apikey": api_key},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
-    if "Error Message" in data:
-        raise ValueError(f"Alpha Vantage API 錯誤（{symbol}）：{data['Error Message']}")
-    if "Note" in data:
-        raise ValueError(f"Alpha Vantage API 額度限制：{data['Note']}（免費版每日限 25 次請求，請稍後再試）")
-    if "Information" in data:
-        raise ValueError(f"Alpha Vantage API 訊息：{data['Information']}（請確認金鑰是否正確）")
-
-    feed = data.get("feed")
-    if not feed:
-        raise ValueError(f"Alpha Vantage 未回傳 {symbol} 的新聞資料，請確認股票代號是否正確。")
-
-    news_list = []
-    for item in feed:
-        ticker_info = None
-        for ts in item.get("ticker_sentiment", []):
-            if ts.get("ticker", "").upper() == symbol:
-                ticker_info = ts
-                break
-
-        try:
-            published_at = datetime.strptime(item.get("time_published", ""), "%Y%m%dT%H%M%S")
-        except ValueError:
-            published_at = None
-
-        news_list.append({
-            "title": item.get("title") or "（無標題）",
-            "url": item.get("url", ""),
-            "published_at": published_at,
-            "source": item.get("source") or "未知來源",
-            "summary": item.get("summary", ""),
-            "overall_sentiment_score": _safe_float(item.get("overall_sentiment_score")),
-            "overall_sentiment_label": item.get("overall_sentiment_label", "N/A"),
-            "topics": item.get("topics", []),
-            "ticker_relevance": _safe_float(ticker_info.get("relevance_score")) if ticker_info else None,
-            "ticker_sentiment_score": _safe_float(ticker_info.get("ticker_sentiment_score")) if ticker_info else None,
-            "ticker_sentiment_label": ticker_info.get("ticker_sentiment_label", "N/A") if ticker_info else "N/A",
-        })
-
-    news_list.sort(key=lambda n: n["published_at"] or datetime.min, reverse=True)
-    return news_list
-
-
-def compute_news_sentiment_stats(news_list: list) -> dict:
-    """將原始新聞清單整理成情緒分布、來源分布、主題分析等統計資料。"""
-    ticker_labels = [x["ticker_sentiment_label"] for x in news_list if x["ticker_sentiment_label"] in SENTIMENT_LABELS_ORDER]
-    article_labels = [x["overall_sentiment_label"] for x in news_list if x["overall_sentiment_label"] in SENTIMENT_LABELS_ORDER]
-
-    def dist(labels):
-        total = len(labels) or 1
-        return {lab: {"count": labels.count(lab), "pct": labels.count(lab) / total} for lab in SENTIMENT_LABELS_ORDER}
-
-    ticker_scores = [x["ticker_sentiment_score"] for x in news_list if x["ticker_sentiment_score"] is not None]
-    article_scores = [x["overall_sentiment_score"] for x in news_list if x["overall_sentiment_score"] is not None]
-    relevance_scores = [x["ticker_relevance"] for x in news_list if x["ticker_relevance"] is not None]
-
-    source_counts = {}
-    for x in news_list:
-        source_counts[x["source"]] = source_counts.get(x["source"], 0) + 1
-    source_counts = dict(sorted(source_counts.items(), key=lambda kv: kv[1], reverse=True))
-
-    topic_scores = {}
-    for x in news_list:
-        for t in x.get("topics", []):
-            name = t.get("topic") or "未知主題"
-            w = _safe_float(t.get("relevance_score")) or 0.0
-            topic_scores[name] = topic_scores.get(name, 0.0) + w
-    topic_scores = dict(sorted(topic_scores.items(), key=lambda kv: kv[1], reverse=True)[:8])
-
-    ticker_dist = dist(ticker_labels)
-    dominant_label = max(ticker_dist.items(), key=lambda kv: kv[1]["count"])[0] if ticker_labels else "N/A"
-
-    return {
-        "n_news": len(news_list),
-        "ticker_sentiment_dist": ticker_dist,
-        "article_sentiment_dist": dist(article_labels),
-        "avg_ticker_score": float(np.mean(ticker_scores)) if ticker_scores else None,
-        "avg_article_score": float(np.mean(article_scores)) if article_scores else None,
-        "avg_relevance": float(np.mean(relevance_scores)) if relevance_scores else None,
-        "source_counts": source_counts,
-        "topic_scores": topic_scores,
-        "dominant_ticker_label": dominant_label,
-    }
-
-
-def fetch_fear_greed_index() -> dict:
-    """嘗試取得 CNN Business 的 Fear & Greed Index（恐懼與貪婪指數，反映整體美股市場情緒）。
-
-    重要說明：CNN 並未提供這項指數的官方公開 API。這裡串接的是外界長期觀察到、CNN
-    網站前端自己在使用的一個「未正式紀錄」資料端點，並非官方合約保證的介面：CNN
-    隨時可能改版、調整回應格式，或封鎖非瀏覽器來源的請求。一旦發生，這個功能會直接
-    拋出例外並在畫面上顯示清楚的錯誤訊息，但不會影響股價、技術指標等其他分析功能。
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-    }
-    resp = requests.get(FEAR_GREED_URL, headers=headers, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-
-    fg = data.get("fear_and_greed")
-    if not fg or fg.get("score") is None:
-        raise ValueError("CNN Fear & Greed Index 回傳格式不如預期（非官方端點可能已變更），暫時無法解析。")
-
-    rating_raw = (fg.get("rating") or "").lower()
-    return {
-        "score": _safe_float(fg.get("score")),
-        "rating_raw": fg.get("rating", "N/A"),
-        "rating_zh": FEAR_GREED_RATING_ZH.get(rating_raw, fg.get("rating", "N/A")),
-        "previous_close": _safe_float(fg.get("previous_close")),
-        "previous_1_week": _safe_float(fg.get("previous_1_week")),
-        "previous_1_month": _safe_float(fg.get("previous_1_month")),
-        "previous_1_year": _safe_float(fg.get("previous_1_year")),
-        "timestamp": fg.get("timestamp"),
     }
 
 
@@ -1493,102 +1303,6 @@ def chart_backtest(backtest: dict, symbol: str, color: str):
     return fig
 
 
-def chart_sentiment_pie(news_stats: dict, symbol: str):
-    """個股情緒分布 + 整體文章情緒分布，並排的兩個環狀圖（配色依五級情緒標準配色）。
-
-    兩張圖用的是完全相同的五級標籤與配色對應（labels / colors 陣列一致），
-    差異只在於底層資料來源不同：
-      - 左圖「個股情緒分布」只計算每則新聞中「明確標記為 {symbol}」的情緒判斷
-        （Alpha Vantage 的 ticker_sentiment，僅限有對應到這支股票的部分）。
-      - 右圖「整體文章情緒分布」則是整篇文章的情緒（overall_sentiment），涵蓋
-        文章討論的所有主題，不限於 {symbol}。
-    因此兩張圖看起來顏色分布不同，並非配色錯誤，而是兩者統計的資料範圍本來就不同；
-    若某個情緒類別在其中一張圖裡則數為 0，該顏色的扇形會消失（角度為 0），也會讓
-    兩張圖「看起來用到的顏色種類」不一樣。
-    """
-    labels = SENTIMENT_LABELS_ORDER
-    display_labels = [_sentiment_label_emoji(l) for l in labels]
-    colors = [SENTIMENT_COLORS[l] for l in labels]
-    ticker_values = [news_stats["ticker_sentiment_dist"][l]["count"] for l in labels]
-    article_values = [news_stats["article_sentiment_dist"][l]["count"] for l in labels]
-
-    fig = make_subplots(rows=1, cols=2, specs=[[{"type": "domain"}, {"type": "domain"}]],
-                         subplot_titles=(f"{symbol} 個股情緒分布", "整體文章情緒分布"))
-
-    # Plotly 的 Pie 預設會依數值大小重新排序扇形（sort=True），這會打亂我們刻意
-    # 排好的「Bearish→Somewhat-Bearish→Neutral→Somewhat-Bullish→Bullish」情緒光譜順序，
-    # 導致同樣偏多方向的 Bullish 跟 Somewhat-Bullish 被中間插入的其他類別隔開、
-    # 看起來不連續。加上 sort=False 讓扇形照 labels 陣列的順序排列，保持光譜連續。
-    fig.add_trace(go.Pie(labels=display_labels, values=ticker_values, marker=dict(colors=colors),
-                          hole=0.4, name="個股情緒", sort=False, direction="clockwise"), row=1, col=1)
-    fig.add_trace(go.Pie(labels=display_labels, values=article_values, marker=dict(colors=colors),
-                          hole=0.4, name="文章情緒", showlegend=False, sort=False, direction="clockwise"),
-                  row=1, col=2)
-
-    fig.update_layout(template="plotly_white", height=380, showlegend=True,
-                       margin=dict(l=20, r=20, t=60, b=20))
-    return fig
-
-
-def chart_sentiment_time_series(news_list: list, symbol: str):
-    """個股新聞情緒分數隨時間變化的散佈／折線圖，並標示 Bullish／Bearish 分類門檻。"""
-    dated = sorted(
-        ((x["published_at"], x["ticker_sentiment_score"]) for x in news_list
-         if x["published_at"] is not None and x["ticker_sentiment_score"] is not None),
-        key=lambda t: t[0],
-    )
-
-    fig = go.Figure()
-    if dated:
-        xs, ys = zip(*dated)
-        fig.add_trace(go.Scatter(x=list(xs), y=list(ys), mode="markers+lines", name="個股情緒分數",
-                                  line=dict(color="#2563eb", width=1.5), marker=dict(size=6)))
-    fig.add_hline(y=0.35, line_dash="dot", line_color="#2ECC71", annotation_text="Bullish 門檻 0.35")
-    fig.add_hline(y=-0.35, line_dash="dot", line_color="#DC143C", annotation_text="Bearish 門檻 -0.35")
-    fig.add_hline(y=0, line_dash="dash", line_color="gray")
-    fig.update_layout(
-        title=f"{symbol}：新聞情緒分數隨時間變化",
-        yaxis_title="情緒分數（-1 極度看空 ～ +1 極度看多）", yaxis_range=[-1, 1],
-        template="plotly_white", height=380, margin=dict(l=40, r=20, t=60, b=40),
-    )
-    return fig
-
-
-def chart_source_distribution(news_stats: dict):
-    """新聞來源分布橫條圖（前10大來源）。"""
-    sources = list(news_stats["source_counts"].keys())[:10]
-    counts = [news_stats["source_counts"][s] for s in sources]
-    fig = go.Figure(go.Bar(x=counts, y=sources, orientation="h", marker=dict(color="#2563eb")))
-    fig.update_layout(
-        title="新聞來源分布（前10大來源）", xaxis_title="新聞則數",
-        template="plotly_white", height=max(300, 34 * max(len(sources), 1)),
-        margin=dict(l=140, r=20, t=60, b=40), yaxis=dict(autorange="reversed"),
-    )
-    return fig
-
-
-def chart_fear_greed_gauge(fg: dict):
-    """CNN Fear & Greed Index 儀表圖（0=極度恐懼 ～ 100=極度貪婪）。"""
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=fg["score"],
-        title={"text": f"CNN Fear & Greed Index：{fg['rating_zh']}"},
-        gauge={
-            "axis": {"range": [0, 100]},
-            "bar": {"color": "#111827"},
-            "steps": [
-                {"range": [0, 25], "color": "#DC143C"},
-                {"range": [25, 45], "color": "#FF6B6B"},
-                {"range": [45, 55], "color": "#95A5A6"},
-                {"range": [55, 75], "color": "#90EE90"},
-                {"range": [75, 100], "color": "#2ECC71"},
-            ],
-        },
-    ))
-    fig.update_layout(template="plotly_white", height=300, margin=dict(l=30, r=30, t=60, b=10))
-    return fig
-
-
 # ----------------------------------------------------------------------------
 # 4. Gemini AI 分析
 # ----------------------------------------------------------------------------
@@ -1761,106 +1475,6 @@ def call_gemini(prompt: str, api_key: str, model: str = "gemini-3.5-flash-lite")
         return "".join(p.get("text", "") for p in parts)
     except (KeyError, IndexError) as exc:
         raise RuntimeError(f"無法解析 Gemini 回傳內容：{json.dumps(data, ensure_ascii=False)[:500]}") from exc
-
-
-def build_news_summary_prompt(symbol: str, news_stats: dict, news_list: list, fg: dict = None) -> str:
-    """建構送給 Gemini 的「市場情緒總結」提示語：只要求 3-5 句話的簡短客觀總結。"""
-    top_titles = "\n".join(
-        f"- {x['title']}（{x['source']}，{x['ticker_sentiment_label']}）" for x in news_list[:15]
-    )
-    fg_line = (f"目前 CNN Fear & Greed Index：{fg['score']:.0f} 分（{fg['rating_zh']}）"
-               if fg and fg.get("score") is not None else "（本次未取得 Fear & Greed Index 資料）")
-
-    return f"""你是一位客觀中立的市場情緒分析師。請根據以下 {symbol} 的新聞情緒統計資料，用 3 到 5 句話、
-以繁體中文簡短總結目前市場對這檔股票的新聞情緒狀態。只描述「數據顯示」的歷史情緒統計現象，不要給出
-任何投資建議、預測或操作暗示，也不要使用「應該」「建議」「預期」等字眼。
-
-{fg_line}
-個股情緒分布（則數）：{ {k: v['count'] for k, v in news_stats['ticker_sentiment_dist'].items()} }
-文章情緒分布（則數）：{ {k: v['count'] for k, v in news_stats['article_sentiment_dist'].items()} }
-平均個股情緒分數：{_fmt_num(news_stats['avg_ticker_score'], 3)}
-平均相關性分數：{_fmt_num(news_stats['avg_relevance'], 3)}
-主要新聞來源：{list(news_stats['source_counts'].keys())[:5]}
-
-近期新聞標題（節錄）：
-{top_titles}
-"""
-
-
-def build_news_ai_prompt(symbol: str, stats: dict, news_stats: dict, news_list: list, fg: dict = None) -> str:
-    """建構送給 Gemini 的「新聞情緒深度分析」提示語：結合股價技術面資料與新聞情緒統計，
-    要求輸出「分析總結／媒體情緒觀察／綜合分析結果」三段式結構化報告。
-
-    設計原則沿用規格說明書：角色設定為客觀中立的情緒分析師、僅描述歷史統計現象、
-    禁止暗示性的建議用詞、全程繁體中文、並附上明確的教育性免責聲明。
-    """
-    fg_block = (
-        f"- CNN Fear & Greed Index：{fg['score']:.0f} 分（{fg['rating_zh']}），"
-        f"前一交易日 {_fmt_num(fg['previous_close'], 0)} 分／一週前 {_fmt_num(fg['previous_1_week'], 0)} 分／"
-        f"一個月前 {_fmt_num(fg['previous_1_month'], 0)} 分"
-        if fg and fg.get("score") is not None else "- 本次未取得 CNN Fear & Greed Index 資料"
-    )
-
-    news_detail = "\n".join(
-        f"{i+1}. [{x['published_at'].strftime('%Y-%m-%d %H:%M') if x['published_at'] else 'N/A'}] "
-        f"{x['title']}（來源：{x['source']}／個股情緒：{x['ticker_sentiment_label']}"
-        f"（{_fmt_num(x['ticker_sentiment_score'], 3)}）／相關性：{_fmt_num(x['ticker_relevance'], 3)}）"
-        for i, x in enumerate(news_list[:20])
-    )
-
-    return f"""你是一位專業的市場情緒分析師，專精於新聞情緒解讀與投資心理分析。你的職責包括：
-1. 客觀分析新聞情緒數據的分布和趨勢
-2. 解讀市場情緒對投資決策的潛在影響（僅描述歷史現象，非預測）
-3. 識別新聞來源的可信度和影響力
-4. 提供純教育性的情緒分析知識
-
-重要原則：
-- 僅提供歷史新聞情緒分析和市場心理解讀，絕不提供任何投資建議或預測
-- 保持完全客觀中立的分析態度；使用專業術語但保持易懂；全程使用繁體中文
-- 使用「數據顯示」「情緒指標反映」「歷史統計呈現」等客觀描述
-- 避免「可能性」「預期」「建議」「應該」等暗示性用詞
-- 禁用「如果...則...」的假設句型，改用「歷史上當...時，曾出現...現象」
-- 強調「情緒數據僅供參考，不代表投資結果」
-
-### {symbol} 基本資訊
-- 分析新聞則數：{news_stats['n_news']}
-- 最新收盤價（技術指標資料，更新至 {stats['latest_date'].date().isoformat()}）：{_fmt_num(stats['latest_close'])}
-{fg_block}
-
-### 情緒統計數據
-- 個股情緒分布（則數）：{ {k: v['count'] for k, v in news_stats['ticker_sentiment_dist'].items()} }
-- 文章情緒分布（則數）：{ {k: v['count'] for k, v in news_stats['article_sentiment_dist'].items()} }
-- 平均個股情緒分數：{_fmt_num(news_stats['avg_ticker_score'], 3)}（-1 極度看空 ～ +1 極度看多）
-- 平均相關性分數：{_fmt_num(news_stats['avg_relevance'], 3)}（0 無關 ～ 1 高度相關）
-
-### 新聞來源分布
-{news_stats['source_counts']}
-
-### 主要主題分析（依加權相關性排序）
-{news_stats['topic_scores']}
-
-### 新聞情緒明細（依時間排序，最新在前）
-{news_detail}
-
-請嚴格依照以下結構，用繁體中文輸出（使用 Markdown 標題，勿使用表格）：
-
-## 分析總結
-以 3-5 句話總結目前新聞情緒的整體樣貌與強度。
-
-## 媒體情緒觀察
-依據上述新聞標題與摘要，具體指出情緒分布是否集中或分歧、是否有特定來源立場明顯偏多或偏空，
-並比較 Fear & Greed Index（若有資料，屬於大盤層級的整體市場情緒）與個股新聞情緒（僅反映這支
-股票本身的新聞語氣）兩者方向是否一致；若不一致，請說明這是「大盤氣氛」與「個股消息面」本來
-就衡量不同範圍、可能出現分歧的正常現象，不要暗示其中一方有誤。
-
-## 綜合分析結果（短期與中長期）
-分別就「短期（新聞驅動的情緒波動）」與「中長期（基本面／趨勢層面）」，描述歷史上類似情緒組合
-出現後的一般觀察現象，並列出至少 3 項需要留意的風險與限制（含情緒數據本身的局限性、樣本可能
-的偏誤等）。全文避免給出具體的買賣操作建議。
-
-免責聲明：本分析僅基於新聞情緒與 Fear & Greed Index 的統計解讀，純供教育與研究參考，不構成
-任何投資建議或未來走勢預測。
-"""
 
 
 # ----------------------------------------------------------------------------
@@ -2574,30 +2188,15 @@ def run_us_app():
         )
 
         st.markdown("---")
-        st.subheader("📰 新聞情緒分析設定（選用）")
-        enable_news = st.checkbox("啟用新聞情緒分析（Alpha Vantage + Fear & Greed Index）", value=True)
-        alpha_vantage_key = st.text_input(
-            "Alpha Vantage API 金鑰", type="password", value=_secret_default("ALPHA_VANTAGE_API_KEY"),
-            disabled=not enable_news,
-            help="至 https://www.alphavantage.co/support/#api-key 免費申請",
-        )
-        news_limit = st.slider("擷取新聞則數", min_value=10, max_value=200, value=50, step=10,
-                                disabled=not enable_news)
-        st.caption("Alpha Vantage 免費版每日限 25 次 API 請求，請節制重新分析的次數；"
-                   "CNN Fear & Greed Index 串接的是非官方資料端點，可能隨時失效，失效時"
-                   "不影響其餘分析功能。")
-
-        st.markdown("---")
         portfolio_inputs = render_portfolio_inputs_sidebar()
 
         st.markdown("---")
         st.caption("金鑰僅保存於本次瀏覽器 session 記憶體中，不會寫入檔案或上傳。")
         st.markdown("### 📢 免責聲明")
         st.caption(
-            "本系統（含技術指標、規則式建議、新聞情緒分析與 Gemini AI 分析）僅供學術研究與教育用途，"
-            "所有分析結果僅供參考，**不構成投資建議或財務建議**。新聞情緒與 Fear & Greed Index 反映"
-            "的是歷史市場觀點，不代表未來股價走勢。請使用者自行判斷投資決策並承擔相關風險，本系統"
-            "作者不對任何投資行為負責，亦不承擔任何損失責任。"
+            "本系統（含技術指標、規則式建議與 Gemini AI 分析）僅供學術研究與教育用途，"
+            "所有分析結果僅供參考，**不構成投資建議或財務建議**。請使用者自行判斷投資決策並承擔"
+            "相關風險，本系統作者不對任何投資行為負責，亦不承擔任何損失責任。"
         )
 
     input_col, target_col, _spacer_col = st.columns([1, 1, 1])
@@ -2741,174 +2340,6 @@ def run_us_app():
         trend=trend, patterns=patterns, chart_patterns=chart_patterns,
         portfolio_check=portfolio_check,
     )
-
-    st.markdown("---")
-    st.header("📰 新聞情緒分析")
-    st.caption("以下結合 Alpha Vantage 新聞情緒資料與 CNN Fear & Greed Index，"
-               "從「新聞與市場心理」的角度補充上方的技術面分析。")
-
-    if not enable_news:
-        st.info("新聞情緒分析功能未啟用（可在左側勾選「啟用新聞情緒分析」）。")
-    elif not alpha_vantage_key:
-        st.warning("請先在左側輸入 Alpha Vantage API 金鑰，才能取得新聞情緒資料。")
-    else:
-        st.markdown("##### 😨😊 CNN Fear & Greed Index（恐懼與貪婪指數）")
-        try:
-            fg = fetch_fear_greed_index()
-        except Exception as exc:
-            fg = None
-            st.warning(f"目前無法取得 CNN Fear & Greed Index：{exc}\n\n"
-                       "（此為非官方資料端點，CNN 隨時可能調整或封鎖，不影響其他分析功能。）")
-
-        if fg:
-            st.plotly_chart(chart_fear_greed_gauge(fg), use_container_width=True)
-            fgc1, fgc2, fgc3 = st.columns(3)
-            fgc1.metric("前一交易日", _fmt_num(fg["previous_close"], 0))
-            fgc2.metric("一週前", _fmt_num(fg["previous_1_week"], 0))
-            fgc3.metric("一個月前", _fmt_num(fg["previous_1_month"], 0))
-            st.caption("資料來源：CNN Business（非官方端點，僅供參考）。指數範圍 0（極度恐懼）～ "
-                       "100（極度貪婪），反映整體美股市場情緒，並非個股專屬指標。")
-            st.caption(
-                "⚠️ 這個指數跟下方「新聞情緒統計」是兩組互相獨立的資料，衡量的東西本來就不同："
-                "F&G 綜合的是大盤層級的技術面訊號（如市場動能、避險資金流向、選擇權評價等），"
-                "下方新聞情緒則是單獨統計這支股票的新聞文字語氣。兩者方向不一致（例如大盤恐懼、"
-                "但個股新聞中性偏多）是常見且合理的現象，不代表其中一邊算錯，可以把兩者當成"
-                "「大盤氣氛」與「個股消息面」兩個互補的觀察角度來看。"
-            )
-
-        st.markdown("##### 📊 新聞情緒統計")
-        with st.spinner(f"正在向 Alpha Vantage 取得 {symbol} 的新聞情緒資料..."):
-            try:
-                news_list = fetch_alpha_vantage_news(symbol, alpha_vantage_key, news_limit)
-                news_err = None
-            except Exception as exc:
-                news_list, news_err = [], str(exc)
-
-        if news_err:
-            st.error(f"取得新聞情緒資料失敗：{news_err}")
-        elif not news_list:
-            st.info("目前沒有可分析的新聞資料。")
-        else:
-            news_stats = compute_news_sentiment_stats(news_list)
-
-            nc1, nc2, nc3, nc4 = st.columns(4)
-            nc1.metric("總新聞數量", news_stats["n_news"])
-            if news_stats["n_news"] != news_limit:
-                # 這裡的則數是 Alpha Vantage 實際回傳的則數，不一定會等於左側滑桿設定的
-                # 上限（news_limit）：滑桿只是「最多抓幾則」的上限，若該股票在查詢範圍內
-                # 實際能匹配到的相關新聞本來就比較少，回傳則數就會低於設定值，這是正常情況、
-                # 不是程式沒有把滑桿數值送出去（實際送給API的請求上限就是 news_limit）。
-                nc1.caption(f"（已設定上限 {news_limit} 則，Alpha Vantage 實際回傳 {news_stats['n_news']} 則）")
-            nc2.metric("平均情緒評分", _fmt_num(news_stats["avg_article_score"], 3))
-            nc3.metric("平均相關性評分", _fmt_num(news_stats["avg_relevance"], 3))
-            with nc4:
-                # 用自訂樣式取代 st.metric：st.metric 的數值字級較大，
-                # 「Somewhat-Bullish」這類較長的標籤在四欄窄版面下容易被裁切看不全，
-                # 這裡改用較小字級並允許換行，確保完整顯示。
-                st.markdown(
-                    f"""
-                    <div style="display:flex;flex-direction:column;gap:2px;">
-                        <div style="font-size:0.8rem;color:#6b7280;">主要情緒傾向</div>
-                        <div style="font-size:1.1rem;font-weight:600;color:#111827;
-                                    line-height:1.3;overflow-wrap:break-word;">
-                            {_sentiment_label_emoji(news_stats['dominant_ticker_label'])}
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-            st.plotly_chart(chart_sentiment_pie(news_stats, symbol), use_container_width=True)
-            st.caption(
-                f"左圖只計算新聞中「明確標記與 {symbol} 相關」的情緒判斷；右圖則是整篇文章的情緒，"
-                "涵蓋文章討論的所有主題、不限於這支股票，兩者統計範圍不同，比例與顯示出來的顏色"
-                "種類也可能不同（某類情緒則數為 0 時，該顏色的扇形就不會出現），這是資料本身的"
-                "差異，配色定義本身兩張圖是一致的。"
-            )
-
-            with st.expander("ℹ️ 情緒分數／相關性分數說明"):
-                st.markdown(
-                    "**情緒分數**範圍 -1（極度看空）～ +1（極度看多）：\n"
-                    "- 😊 Bullish（看漲）：分數 ≥ 0.35\n"
-                    "- 🙂 Somewhat-Bullish（偏看漲）：0.15 ～ 0.35\n"
-                    "- 😐 Neutral（中性）：-0.15 ～ 0.15\n"
-                    "- 🙁 Somewhat-Bearish（偏看跌）：-0.35 ～ -0.15\n"
-                    "- 😢 Bearish（看跌）：分數 ≤ -0.35\n\n"
-                    "**相關性分數**範圍 0（無關）～ 1（高度相關）：\n"
-                    "- 高度相關：≥ 0.8　- 相關：0.5 ～ 0.8　- 中度相關：0.3 ～ 0.5　- 低度相關：< 0.3"
-                )
-
-            ntc1, ntc2 = st.columns(2)
-            with ntc1:
-                st.plotly_chart(chart_sentiment_time_series(news_list, symbol), use_container_width=True)
-            with ntc2:
-                st.plotly_chart(chart_source_distribution(news_stats), use_container_width=True)
-
-            st.markdown("##### 📰 相關新聞列表（依相關性排序，取前10則）")
-            top_news = sorted(news_list, key=lambda x: x["ticker_relevance"] or 0, reverse=True)[:10]
-            for i, item in enumerate(top_news, 1):
-                with st.expander(f"{i}. 📰 {item['title']} ｜ 🎯 {_sentiment_label_emoji(item['ticker_sentiment_label'])}"):
-                    ec1, ec2, ec3 = st.columns(3)
-                    with ec1:
-                        pub = item["published_at"].strftime("%Y-%m-%d %H:%M") if item["published_at"] else "N/A"
-                        st.markdown(f"**發布時間**：{pub}")
-                        st.markdown(f"**股票情緒**：{_sentiment_label_emoji(item['ticker_sentiment_label'])}"
-                                    f"（{_fmt_num(item['ticker_sentiment_score'], 3)}）")
-                        st.markdown(f"**文章情緒**：{_sentiment_label_emoji(item['overall_sentiment_label'])}"
-                                    f"（{_fmt_num(item['overall_sentiment_score'], 3)}）")
-                        st.markdown(f"**相關性**：{_fmt_num(item['ticker_relevance'], 3)}")
-                    with ec2:
-                        st.markdown("**相關主題**")
-                        topics = sorted(
-                            item.get("topics", []),
-                            key=lambda t: _safe_float(t.get("relevance_score")) or 0, reverse=True,
-                        )[:3]
-                        if topics:
-                            for t in topics:
-                                st.markdown(f"- {t.get('topic', 'N/A')}"
-                                            f"（權重 {_fmt_num(_safe_float(t.get('relevance_score')), 3)}）")
-                        else:
-                            st.caption("無主題資料")
-                    with ec3:
-                        summary = item["summary"] or ""
-                        st.markdown(f"**摘要**：{summary[:200]}{'...' if len(summary) > 200 else ''}")
-                        if item["url"]:
-                            st.markdown(f"[閱讀原文]({item['url']})")
-
-            st.markdown("##### 🧠 市場情緒總結（Gemini AI）")
-            if not gemini_key:
-                st.warning("請先在左側輸入 Gemini API 金鑰才能產生市場情緒總結。")
-            else:
-                with st.spinner("正在請 Gemini 分析市場情緒..."):
-                    try:
-                        news_summary = call_gemini(
-                            build_news_summary_prompt(symbol, news_stats, news_list, fg),
-                            gemini_key, gemini_model,
-                        )
-                    except Exception as exc:
-                        news_summary = None
-                        st.error(str(exc))
-                if news_summary:
-                    st.markdown(news_summary)
-
-            st.markdown("##### 🤖 新聞情緒 AI 深度分析（Gemini AI）")
-            if not gemini_key:
-                st.warning("請先在左側輸入 Gemini API 金鑰才能產生新聞情緒深度分析。")
-            else:
-                with st.spinner("正在請 Gemini 產生新聞情緒深度分析報告..."):
-                    news_ai_prompt = build_news_ai_prompt(symbol, stats, news_stats, news_list, fg)
-                    try:
-                        news_analysis = call_gemini(news_ai_prompt, gemini_key, gemini_model)
-                    except Exception as exc:
-                        news_analysis = None
-                        st.error(str(exc))
-                if news_analysis:
-                    st.markdown(news_analysis)
-                    with st.expander("查看送給 Gemini 的新聞情緒分析提示語（prompt）"):
-                        st.code(news_ai_prompt, language="text")
-
-        st.caption("📢 免責聲明：新聞情緒分析與 Fear & Greed Index 僅反映歷史新聞與市場情緒統計，"
-                   "不構成投資建議或未來走勢預測，請自行判斷並承擔投資風險。")
 
 
 # ----------------------------------------------------------------------------
